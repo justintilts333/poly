@@ -53,12 +53,17 @@ jobs:
 
                echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy complete" >> "$LOG"
 
-               # Kill duplicate scanners and start exactly one fresh instance
-               pkill -f "node.*scanner.js" 2>/dev/null || true
+               # Kill all scanner processes and wait for them to die
+               pkill -KILL -f "node.*scanner.js" 2>/dev/null || true
+               sleep 2
                rm -f /tmp/polymarket-scanner.lock
-               sleep 1
-               nohup node "$APP_DIR/scanner.js" >> "$LOG" 2>&1 &
-               echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Scanner launched (PID $!)" >> "$LOG"'
+
+               # Start exactly one scanner, fully detached from this SSH session
+               nohup node "$APP_DIR/scanner.js" </dev/null >> "$LOG" 2>&1 &
+               SCANNER_PID=$!
+               disown $SCANNER_PID
+               echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Scanner launched (PID $SCANNER_PID)" >> "$LOG"
+               exit 0'
 
       - name: Verify dashboard is up
         run: |
