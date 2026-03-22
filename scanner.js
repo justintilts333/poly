@@ -107,9 +107,54 @@ function fetchJSON(url, retries = 3, delayMs = 2000) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+function postJSON(url, body, token) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(body);
+    const parsed = new URL(url);
+    const req = https.request({
+      hostname: parsed.hostname,
+      path: parsed.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Content-Length': Buffer.byteLength(bodyStr),
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; PolymarketScanner/1.0)',
+      },
+      timeout: 15000,
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+          return;
+        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error(`JSON parse: ${e.message}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+async function fetchFalconStats(address) {
+  return postJSON(`${FALCON_API}/traders/stats`, {
+    wallet: address,
+    metrics: ['pnl', 'roi', 'win_rate', 'drawdown'],
+    timeframe: '90d',
+  }, FALCON_TOKEN);
+}
+
 const DATA_API        = 'https://data-api.polymarket.com';
 const DATA_API_V1     = 'https://data-api.polymarket.com/v1';
 const GAMMA_API       = 'https://gamma-api.polymarket.com';
+const FALCON_API      = 'https://narrative.agent.heisenberg.so/v2';
+const FALCON_TOKEN    = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc5MzgxMTkzLCJpYXQiOjE3NzQxOTcxOTMsImp0aSI6IjBhNzhkMTJiMDYxMTRkYzBiMzk3N2M4Y2FkZGUwMTdlIiwidXNlcl9pZCI6Njk4LCJzY29wZSI6ImxhdW5jaHBhZDphZ2VudC1yZWFkLHJldHJpZXZlcjplY2hvLWdlbmVyYXRpb24scmV0cmlldmVyOmZlYXR1cmUtZXh0cmFjdGlvbix1c2VyOnJlYWQscmV0cmlldmVyOmFnZW50LW9wdGlvbi1yZXRyaWV2YWwsbGF1bmNocGFkOmFnZW50LWNyZWF0aW9uLGxhdW5jaHBhZDphZ2VudC11cGRhdGUsdXNlcjp3cml0ZSxyZXRyaWV2ZXI6c2VtYW50aWMtcmV0cmlldmFsLGxhdW5jaHBhZDplY2hvLXN0eWxlLWNyZWF0aW9uIiwidG9rZW5fbmFtZSI6ImJhc2VfbG9naW4ifQ.yJXa3tVrvmLP3ptf6vfvV_yfhI6zqmSqNR3W0Zc0Pow';
 
 // ── 1. Leaderboard ────────────────────────────────────────────────────────────
 // Endpoint: /v1/leaderboard — max 50 results, no offset pagination support.
@@ -377,6 +422,30 @@ async function runScan() {
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
   const sortFn = (a, b) => b.winRate - a.winRate || b.totalQualifying - a.totalQualifying;
   [tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
+
+  // ── Falcon enrichment ─────────────────────────────────────────────────────
+  const toEnrich = [...seen.values()];
+  log(`Enriching ${toEnrich.length} wallets with Falcon API stats...`);
+  let falconOk = 0, falconFail = 0;
+  for (const record of toEnrich) {
+    try {
+      const f = await fetchFalconStats(record.address);
+      if (f && typeof f.total_pnl === 'number') {
+        record.falconPnl          = f.total_pnl;
+        record.falconRoi          = f.roi;
+        record.falconWinRate      = f.win_rate;
+        record.falconDrawdown     = f.max_drawdown;
+        record.falconTotalTrades  = f.total_trades;
+        record.falconActivePositions = f.active_positions;
+        falconOk++;
+      }
+    } catch (e) {
+      falconFail++;
+      if (falconFail === 1) logError('Falcon stats fetch failed (first error)', e);
+    }
+    await sleep(200);
+  }
+  log(`Falcon enrichment: ${falconOk} enriched, ${falconFail} failed`);
 
   const results = {
     scanTime: new Date().toISOString(),
