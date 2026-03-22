@@ -9,18 +9,30 @@ const LOG_FILE = '/var/log/polymarket-scanner.log';
 const DATA_FILE = path.join(__dirname, 'data', 'results.json');
 const LOCK_FILE = '/tmp/polymarket-scanner.lock';
 
-// ── Single-instance lock ──────────────────────────────────────────────────────
-if (fs.existsSync(LOCK_FILE)) {
-  const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-  try {
-    process.kill(pid, 0); // check if still running
-    console.error(`Scanner already running (PID ${pid}). Exiting.`);
-    process.exit(0);
-  } catch (_) {
-    fs.unlinkSync(LOCK_FILE); // stale lock
+// ── Single-instance lock (atomic: wx flag fails if file exists) ───────────────
+try {
+  const fd = fs.openSync(LOCK_FILE, 'wx');
+  fs.writeSync(fd, String(process.pid));
+  fs.closeSync(fd);
+} catch (e) {
+  if (e.code === 'EEXIST') {
+    // Lock exists — check if the owning process is still alive
+    try {
+      const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+      process.kill(pid, 0);
+      console.error(`Scanner already running (PID ${pid}). Exiting.`);
+      process.exit(0);
+    } catch (_) {
+      // Stale lock — remove and re-acquire
+      fs.unlinkSync(LOCK_FILE);
+      const fd = fs.openSync(LOCK_FILE, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+    }
+  } else {
+    throw e;
   }
 }
-fs.writeFileSync(LOCK_FILE, String(process.pid));
 process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch (_) {} });
 process.on('SIGINT', () => process.exit());
 process.on('SIGTERM', () => process.exit());
