@@ -18,3 +18,4 @@ Every push to `claude/polymarket-wallet-scanner-ofqu0` triggers:
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/justintilts333/poly/claude%2Fpolymarket-wallet-scanner-ofqu0/deploy.sh)
 ```
+# Last auto-deploy test: Sun Mar 22 07:37:51 UTC 2026
