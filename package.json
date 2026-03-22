@@ -1,0 +1,16 @@
+{
+  "name": "polymarket-wallet-scanner",
+  "version": "1.0.0",
+  "description": "Scans Polymarket wallets for performance criteria and serves results on a dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "scan": "node scanner.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
