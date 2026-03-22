@@ -7,11 +7,15 @@ LOG=/var/log/polymarket-scanner.log
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy triggered" >> "$LOG"
 
 (
-  # Kill existing scanner
+  # Kill ALL existing scanners and wait for them to be gone
   pkill -KILL -f "node.*scanner.js" 2>/dev/null || true
+  for i in $(seq 1 10); do
+    pgrep -f "node.*scanner.js" > /dev/null 2>&1 || break
+    sleep 0.5
+  done
   rm -f /tmp/polymarket-scanner.lock
 
-  # Start scanner (fully detached)
+  # Start exactly ONE scanner (fully detached)
   nohup node "$APP_DIR/scanner.js" </dev/null >> "$LOG" 2>&1 &
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Scanner launched (PID $!)" >> "$LOG"
 

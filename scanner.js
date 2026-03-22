@@ -107,8 +107,9 @@ function fetchJSON(url, retries = 3, delayMs = 2000) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const DATA_API  = 'https://data-api.polymarket.com';
-const GAMMA_API = 'https://gamma-api.polymarket.com';
+const DATA_API        = 'https://data-api.polymarket.com';
+const DATA_API_V1     = 'https://data-api.polymarket.com/v1';
+const GAMMA_API       = 'https://gamma-api.polymarket.com';
 
 // ── 1. Leaderboard ────────────────────────────────────────────────────────────
 // Correct endpoint: /leaderboard?timePeriod=ALL&limit=50&offset=N
@@ -121,7 +122,7 @@ async function fetchLeaderboard(limit = 1000) {
 
   while (wallets.size < limit) {
     try {
-      const url = `${DATA_API}/leaderboard?timePeriod=ALL&limit=${pageSize}&offset=${offset}`;
+      const url = `${DATA_API_V1}/leaderboard?timePeriod=ALL&orderBy=PNL&limit=${pageSize}&offset=${offset}`;
       const data = await fetchJSON(url);
       const rows = Array.isArray(data) ? data : (data.data || data.results || []);
       if (!rows.length) break;
@@ -191,7 +192,7 @@ async function fetchWalletTrades(address) {
 
   while (true) {
     try {
-      const url = `${DATA_API}/activity?user=${address}&limit=${pageSize}&offset=${offset}&type=TRADE`;
+      const url = `${DATA_API}/activity?user=${address}&limit=${pageSize}&offset=${offset}&type=TRADE`; // no /v1
       const data = await fetchJSON(url);
       const rows = Array.isArray(data) ? data : (data.data || data.activities || []);
       if (!rows.length) break;
