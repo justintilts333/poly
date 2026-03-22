@@ -2,11 +2,17 @@
 // Discord Channel Message Exporter
 // Exports all messages from a Discord channel to JSON and plain text files.
 //
-// Usage:
-//   DISCORD_TOKEN=your_bot_token node discord-export.js
+// Usage (as a server member with your user token):
+//   DISCORD_TOKEN=your_user_token node discord-export.js
 //
-// The token can also be passed via --token flag:
-//   node discord-export.js --token your_bot_token
+// For a bot token instead:
+//   DISCORD_TOKEN=your_bot_token node discord-export.js --bot
+//
+// How to get your user token:
+//   1. Open Discord in your browser (discord.com/app)
+//   2. Open DevTools → Network tab
+//   3. Reload the page, filter by "api.discord.com"
+//   4. Click any request → Headers → find "authorization" value
 //
 // Output files are saved to data/discord-export-<channelId>-<timestamp>.{json,txt}
 
@@ -17,25 +23,30 @@ const path = require('path');
 const CHANNEL_ID = '1187661156404445204';
 const API_BASE = 'api.discord.com';
 
-function getToken() {
+function getTokenAndMode() {
   const args = process.argv.slice(2);
+  const isBot = args.includes('--bot');
   const tokenFlag = args.findIndex(a => a === '--token');
-  if (tokenFlag !== -1 && args[tokenFlag + 1]) return args[tokenFlag + 1];
-  if (process.env.DISCORD_TOKEN) return process.env.DISCORD_TOKEN;
-  console.error('Error: No Discord token provided.');
-  console.error('Set DISCORD_TOKEN env var or use --token <token>');
-  process.exit(1);
+  const token = tokenFlag !== -1 && args[tokenFlag + 1]
+    ? args[tokenFlag + 1]
+    : process.env.DISCORD_TOKEN;
+  if (!token) {
+    console.error('Error: No Discord token provided.');
+    console.error('Set DISCORD_TOKEN env var or use --token <token>');
+    process.exit(1);
+  }
+  return { token, isBot };
 }
 
-function apiRequest(token, path) {
+function apiRequest(token, isBot, path) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: API_BASE,
       path,
       method: 'GET',
       headers: {
-        Authorization: `Bot ${token}`,
-        'User-Agent': 'DiscordExporter/1.0',
+        Authorization: isBot ? `Bot ${token}` : token,
+        'User-Agent': 'Mozilla/5.0 (compatible; DiscordExporter/1.0)',
       },
     };
     const req = https.request(options, res => {
@@ -45,7 +56,7 @@ function apiRequest(token, path) {
         if (res.statusCode === 429) {
           const retryAfter = parseFloat(res.headers['retry-after'] || '1');
           console.log(`Rate limited. Waiting ${retryAfter}s...`);
-          setTimeout(() => apiRequest(token, path).then(resolve).catch(reject), retryAfter * 1000);
+          setTimeout(() => apiRequest(token, isBot, path).then(resolve).catch(reject), retryAfter * 1000);
           return;
         }
         if (res.statusCode !== 200) {
@@ -64,17 +75,17 @@ function apiRequest(token, path) {
   });
 }
 
-async function fetchChannelInfo(token) {
-  return apiRequest(token, `/api/v10/channels/${CHANNEL_ID}`);
+async function fetchChannelInfo(token, isBot) {
+  return apiRequest(token, isBot, `/api/v10/channels/${CHANNEL_ID}`);
 }
 
-async function fetchMessageBatch(token, before = null) {
+async function fetchMessageBatch(token, isBot, before = null) {
   let url = `/api/v10/channels/${CHANNEL_ID}/messages?limit=100`;
   if (before) url += `&before=${before}`;
-  return apiRequest(token, url);
+  return apiRequest(token, isBot, url);
 }
 
-async function fetchAllMessages(token) {
+async function fetchAllMessages(token, isBot) {
   const allMessages = [];
   let before = null;
   let batch = 0;
@@ -85,7 +96,7 @@ async function fetchAllMessages(token) {
     batch++;
     process.stdout.write(`  Batch ${batch}: fetching up to 100 messages${before ? ` before ${before}` : ''}...`);
 
-    const messages = await fetchMessageBatch(token, before);
+    const messages = await fetchMessageBatch(token, isBot, before);
 
     if (!messages.length) {
       console.log(' done (no more messages).');
@@ -123,21 +134,26 @@ function formatMessage(msg) {
 }
 
 async function main() {
-  const token = getToken();
+  const { token, isBot } = getTokenAndMode();
+  console.log(`Mode: ${isBot ? 'bot token' : 'user token'}`);
 
   // Fetch channel info
   let channelInfo;
   try {
-    channelInfo = await fetchChannelInfo(token);
+    channelInfo = await fetchChannelInfo(token, isBot);
     console.log(`Channel: #${channelInfo.name} (guild: ${channelInfo.guild_id})`);
   } catch (err) {
     console.error(`Failed to fetch channel info: ${err.message}`);
-    console.error('Make sure your bot has access to this channel.');
+    if (!isBot) {
+      console.error('Make sure your user token is correct (see instructions at top of file).');
+    } else {
+      console.error('Make sure your bot has access to this channel.');
+    }
     process.exit(1);
   }
 
   // Fetch all messages
-  const messages = await fetchAllMessages(token);
+  const messages = await fetchAllMessages(token, isBot);
 
   if (!messages.length) {
     console.log('No messages found.');
