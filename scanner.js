@@ -112,31 +112,25 @@ const DATA_API_V1     = 'https://data-api.polymarket.com/v1';
 const GAMMA_API       = 'https://gamma-api.polymarket.com';
 
 // ── 1. Leaderboard ────────────────────────────────────────────────────────────
-// Correct endpoint: /leaderboard?timePeriod=ALL&limit=50&offset=N
-// Wallet field: proxyWallet
-async function fetchLeaderboard(limit = 1000) {
-  log(`Fetching top ${limit} wallets from leaderboard...`);
+// Endpoint: /v1/leaderboard — max 50 results, no offset pagination support.
+// Fetch multiple time windows to maximise wallet coverage.
+async function fetchLeaderboard() {
   const wallets = new Set();
-  const pageSize = 50; // API max is 50
-  let offset = 0;
+  const periods = ['ALL', 'MONTH', 'WEEK'];
 
-  while (wallets.size < limit) {
+  for (const period of periods) {
     try {
-      const url = `${DATA_API_V1}/leaderboard?timePeriod=ALL&orderBy=PNL&limit=${pageSize}&offset=${offset}`;
+      const url = `${DATA_API_V1}/leaderboard?timePeriod=${period}&orderBy=PNL&limit=50`;
       const data = await fetchJSON(url);
       const rows = Array.isArray(data) ? data : (data.data || data.results || []);
-      if (!rows.length) break;
       for (const row of rows) {
         const addr = row.proxyWallet || row.address || row.wallet;
         if (addr) wallets.add(addr.toLowerCase());
       }
-      log(`  Leaderboard offset=${offset}: ${rows.length} rows, total=${wallets.size}`);
-      if (rows.length < pageSize) break;
-      offset += pageSize;
-      await sleep(400);
+      log(`  Leaderboard ${period}: ${rows.length} rows, running total=${wallets.size}`);
+      await sleep(300);
     } catch (e) {
-      logError(`Leaderboard page offset=${offset} failed`, e);
-      break;
+      logError(`Leaderboard ${period} failed`, e);
     }
   }
   log(`Leaderboard complete: ${wallets.size} wallets`);
