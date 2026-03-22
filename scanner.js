@@ -198,7 +198,7 @@ async function fetchMarketHolders(topMarkets) {
   for (let i = 0; i < topMarkets.length; i++) {
     const { conditionId } = topMarkets[i];
     try {
-      const url = `${DATA_API}/positions?market=${conditionId}&limit=50`;
+      const url = `${DATA_API}/positions?conditionId=${conditionId}&limit=50`;
       const data = await fetchJSON(url, 2, 1000);
       const rows = Array.isArray(data) ? data : (data.data || data.positions || []);
       if (i === 0) log(`  [DEBUG] positions[0] keys: ${rows.length ? Object.keys(rows[0]).join(',') : 'empty'}`);
