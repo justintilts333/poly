@@ -70,6 +70,11 @@ if command -v ufw &>/dev/null; then
   ufw allow 3000/tcp 2>/dev/null || true
 fi
 
+# --- Kill any stale scanner processes before starting fresh ---
+pkill -f "node.*scanner.js" 2>/dev/null || true
+rm -f /tmp/polymarket-scanner.lock
+sleep 1
+
 # --- Run initial scan in background ---
 echo ""
 echo "Starting initial wallet scan in background..."

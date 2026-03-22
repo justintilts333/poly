@@ -2,128 +2,133 @@
 'use strict';
 
 const https = require('https');
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const LOG_FILE = '/var/log/polymarket-scanner.log';
 const DATA_FILE = path.join(__dirname, 'data', 'results.json');
+const LOCK_FILE = '/tmp/polymarket-scanner.lock';
 
-// ── Logging ──────────────────────────────────────────────────────────────────
+// ── Single-instance lock ──────────────────────────────────────────────────────
+if (fs.existsSync(LOCK_FILE)) {
+  const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+  try {
+    process.kill(pid, 0); // check if still running
+    console.error(`Scanner already running (PID ${pid}). Exiting.`);
+    process.exit(0);
+  } catch (_) {
+    fs.unlinkSync(LOCK_FILE); // stale lock
+  }
+}
+fs.writeFileSync(LOCK_FILE, String(process.pid));
+process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch (_) {} });
+process.on('SIGINT', () => process.exit());
+process.on('SIGTERM', () => process.exit());
+
+// ── Logging ───────────────────────────────────────────────────────────────────
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   process.stdout.write(line);
   try { fs.appendFileSync(LOG_FILE, line); } catch (_) {}
 }
-
 function logError(msg, err) {
   const line = `[${new Date().toISOString()}] ERROR: ${msg}${err ? ' | ' + (err.message || err) : ''}\n`;
   process.stderr.write(line);
   try { fs.appendFileSync(LOG_FILE, line); } catch (_) {}
 }
 
-// ── HTTP helper with retry + exponential backoff ──────────────────────────────
-function fetchJSON(url, retries = 3, delayMs = 1000) {
+// ── HTTP helper ───────────────────────────────────────────────────────────────
+function fetchJSON(url, retries = 3, delayMs = 2000) {
   return new Promise((resolve, reject) => {
     const attempt = (n, delay) => {
-      const lib = url.startsWith('https') ? https : http;
-      const req = lib.get(url, {
+      const req = https.get(url, {
         headers: {
           'Accept': 'application/json',
-          'User-Agent': 'PolymarketScanner/1.0',
+          'User-Agent': 'Mozilla/5.0 (compatible; PolymarketScanner/1.0)',
         },
         timeout: 30000,
       }, (res) => {
         if (res.statusCode === 429) {
-          const retryAfter = parseInt(res.headers['retry-after'] || '5', 10) * 1000;
-          log(`Rate limited on ${url}, waiting ${retryAfter}ms`);
-          setTimeout(() => attempt(n, delay), retryAfter);
+          const wait = parseInt(res.headers['retry-after'] || '10', 10) * 1000;
+          log(`Rate limited, waiting ${wait}ms`);
+          res.resume();
+          setTimeout(() => attempt(n, delay), wait);
           return;
         }
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return fetchJSON(res.headers.location, retries, delayMs).then(resolve).catch(reject);
-        }
         if (res.statusCode !== 200) {
+          res.resume();
           if (n > 0) {
-            log(`HTTP ${res.statusCode} for ${url}, retrying in ${delay}ms (${n} left)`);
             setTimeout(() => attempt(n - 1, delay * 2), delay);
             return;
           }
           return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
         }
         let data = '';
-        res.on('data', chunk => { data += chunk; });
+        res.on('data', c => { data += c; });
         res.on('end', () => {
           try { resolve(JSON.parse(data)); }
-          catch (e) { reject(new Error(`JSON parse error for ${url}: ${e.message}`)); }
+          catch (e) { reject(new Error(`JSON parse error: ${e.message}`)); }
         });
       });
-      req.on('error', (err) => {
-        if (n > 0) {
-          log(`Request error for ${url}: ${err.message}, retrying in ${delay}ms (${n} left)`);
-          setTimeout(() => attempt(n - 1, delay * 2), delay);
-        } else {
-          reject(err);
-        }
+      req.on('error', err => {
+        if (n > 0) setTimeout(() => attempt(n - 1, delay * 2), delay);
+        else reject(err);
       });
       req.on('timeout', () => {
         req.destroy();
-        if (n > 0) {
-          log(`Timeout for ${url}, retrying in ${delay}ms (${n} left)`);
-          setTimeout(() => attempt(n - 1, delay * 2), delay);
-        } else {
-          reject(new Error(`Timeout for ${url}`));
-        }
+        if (n > 0) setTimeout(() => attempt(n - 1, delay * 2), delay);
+        else reject(new Error(`Timeout: ${url}`));
       });
     };
     attempt(retries, delayMs);
   });
 }
 
-// ── Sleep ─────────────────────────────────────────────────────────────────────
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Polymarket Data API ───────────────────────────────────────────────────────
-const DATA_API = 'https://data-api.polymarket.com';
+const DATA_API  = 'https://data-api.polymarket.com';
 const GAMMA_API = 'https://gamma-api.polymarket.com';
 
+// ── 1. Leaderboard ────────────────────────────────────────────────────────────
+// Correct endpoint: /leaderboard?timePeriod=ALL&limit=50&offset=N
+// Wallet field: proxyWallet
 async function fetchLeaderboard(limit = 1000) {
   log(`Fetching top ${limit} wallets from leaderboard...`);
   const wallets = new Set();
-  const pageSize = 100;
+  const pageSize = 50; // API max is 50
   let offset = 0;
 
   while (wallets.size < limit) {
     try {
-      const url = `${DATA_API}/leaderboard?limit=${pageSize}&offset=${offset}&window=all`;
+      const url = `${DATA_API}/leaderboard?timePeriod=ALL&limit=${pageSize}&offset=${offset}`;
       const data = await fetchJSON(url);
       const rows = Array.isArray(data) ? data : (data.data || data.results || []);
       if (!rows.length) break;
       for (const row of rows) {
-        const addr = row.address || row.wallet || row.user;
+        const addr = row.proxyWallet || row.address || row.wallet;
         if (addr) wallets.add(addr.toLowerCase());
       }
-      log(`  Leaderboard page offset=${offset}: got ${rows.length} rows, total unique=${wallets.size}`);
+      log(`  Leaderboard offset=${offset}: ${rows.length} rows, total=${wallets.size}`);
       if (rows.length < pageSize) break;
       offset += pageSize;
-      if (wallets.size >= limit) break;
-      await sleep(300);
+      await sleep(400);
     } catch (e) {
-      logError(`Leaderboard fetch failed at offset=${offset}`, e);
+      logError(`Leaderboard page offset=${offset} failed`, e);
       break;
     }
   }
-  log(`Leaderboard fetch complete: ${wallets.size} wallets`);
+  log(`Leaderboard complete: ${wallets.size} wallets`);
   return [...wallets];
 }
 
-async function fetchMarketsWithShortResolution(maxDays = 14) {
-  log(`Fetching markets with resolution <= ${maxDays} days...`);
-  const markets = [];
-  const pageSize = 100;
+// ── 2. Short-resolution markets ───────────────────────────────────────────────
+// Returns a Set of conditionIds for markets resolving within maxDays
+async function fetchShortResolutionMarketIds(maxDays = 14) {
+  log(`Fetching markets resolving within ${maxDays} days...`);
+  const conditionIds = new Set();
+  const pageSize = 500;
   let offset = 0;
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() + maxDays);
+  const deadlineCutoff = Date.now() + maxDays * 86400000;
 
   while (true) {
     try {
@@ -132,59 +137,32 @@ async function fetchMarketsWithShortResolution(maxDays = 14) {
       const rows = Array.isArray(data) ? data : (data.data || data.markets || []);
       if (!rows.length) break;
 
+      let added = 0;
       for (const m of rows) {
-        const endDate = m.endDate || m.end_date || m.resolutionDate || m.resolution_date;
+        const endDate = m.endDate || m.end_date || m.resolutionDate;
         if (!endDate) continue;
-        const end = new Date(endDate);
-        const daysLeft = (end - Date.now()) / 86400000;
-        if (daysLeft <= maxDays && daysLeft >= 0) {
-          markets.push({
-            id: m.conditionId || m.condition_id || m.id,
-            slug: m.slug,
-            question: m.question,
-            endDate,
-            category: m.category || m.tags?.[0] || 'Unknown',
-          });
+        const endTs = new Date(endDate).getTime();
+        if (endTs > Date.now() && endTs <= deadlineCutoff) {
+          const cid = m.conditionId || m.condition_id;
+          if (cid) { conditionIds.add(cid.toLowerCase()); added++; }
         }
       }
-
+      log(`  Markets offset=${offset}: ${rows.length} rows, ${added} short-res, total=${conditionIds.size}`);
       if (rows.length < pageSize) break;
       offset += pageSize;
-      await sleep(300);
+      await sleep(400);
     } catch (e) {
       logError('Markets fetch failed', e);
       break;
     }
   }
-  log(`Found ${markets.length} markets with sub-${maxDays}-day resolution`);
-  return markets;
+  log(`Found ${conditionIds.size} short-resolution market conditionIds`);
+  return conditionIds;
 }
 
-async function fetchActiveTraders(marketConditionIds) {
-  const wallets = new Set();
-  log(`Fetching active traders from ${marketConditionIds.length} short-resolution markets...`);
-
-  // Sample up to 50 markets to avoid too many requests
-  const sample = marketConditionIds.slice(0, 50);
-  for (const conditionId of sample) {
-    try {
-      const url = `${DATA_API}/activity?market=${conditionId}&limit=100`;
-      const data = await fetchJSON(url);
-      const rows = Array.isArray(data) ? data : (data.data || data.activities || []);
-      for (const row of rows) {
-        const addr = row.user || row.address || row.maker || row.taker;
-        if (addr) wallets.add(addr.toLowerCase());
-      }
-      await sleep(200);
-    } catch (e) {
-      // skip silently
-    }
-  }
-  log(`Found ${wallets.size} active traders from short-resolution markets`);
-  return [...wallets];
-}
-
-// ── Trade history for a single wallet ────────────────────────────────────────
+// ── 3. Wallet trade history ───────────────────────────────────────────────────
+// Correct endpoint: /activity?user={address}&limit=100&offset=N
+// Key fields: price/avgPrice, side, conditionId, timestamp, cashPnl, realizedPnl
 async function fetchWalletTrades(address) {
   const trades = [];
   const pageSize = 100;
@@ -192,106 +170,80 @@ async function fetchWalletTrades(address) {
 
   while (true) {
     try {
-      const url = `${DATA_API}/activity?user=${address}&limit=${pageSize}&offset=${offset}`;
+      const url = `${DATA_API}/activity?user=${address}&limit=${pageSize}&offset=${offset}&type=TRADE`;
       const data = await fetchJSON(url);
       const rows = Array.isArray(data) ? data : (data.data || data.activities || []);
       if (!rows.length) break;
       trades.push(...rows);
       if (rows.length < pageSize) break;
       offset += pageSize;
-      await sleep(150);
+      await sleep(200);
     } catch (e) {
-      logError(`Failed to fetch trades for ${address}`, e);
+      logError(`Trade fetch failed for ${address}`, e);
       break;
     }
   }
   return trades;
 }
 
-// ── Parse and evaluate a wallet ───────────────────────────────────────────────
-function parsePrice(p) {
-  if (p === null || p === undefined) return null;
-  const n = parseFloat(p);
-  return isNaN(n) ? null : n;
-}
+// ── 4. Evaluate a wallet ──────────────────────────────────────────────────────
+function evaluateWallet(address, trades, shortConditionIds) {
+  const thirtyDaysAgo = Date.now() - 30 * 86400000;
 
-function evaluateWallet(address, trades, shortResolutionMarketIds) {
-  // Normalise market ids to a set of lowercase strings
-  const shortIds = new Set(shortResolutionMarketIds.map(id => String(id).toLowerCase()));
-
-  // Filter to qualifying trades: entry price < $0.50 AND short-resolution market
-  const now = Date.now();
-  const thirtyDaysAgo = now - 30 * 86400000;
-
+  // Only BUY-side trades with price < 0.50 in short-resolution markets
   const qualifying = trades.filter(t => {
-    const price = parsePrice(t.price || t.usdcSize || t.outcomePrice);
-    const marketId = String(t.market || t.conditionId || t.condition_id || '').toLowerCase();
-    const isShort = shortIds.size === 0 || shortIds.has(marketId); // if no ids, include all
-    return price !== null && price < 0.50 && isShort;
+    if (t.side !== 'BUY') return false;
+    const price = parseFloat(t.price ?? t.avgPrice ?? 1);
+    if (isNaN(price) || price >= 0.50) return false;
+    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    return shortConditionIds.size === 0 || shortConditionIds.has(cid);
   });
 
   if (!qualifying.length) return null;
 
-  // Last active
-  const timestamps = trades.map(t => {
-    const ts = t.timestamp || t.createdAt || t.created_at || t.time;
-    return ts ? new Date(ts).getTime() : 0;
+  // Must have been active in last 30 days
+  const allTimestamps = trades.map(t => {
+    const ts = t.timestamp;
+    return typeof ts === 'number' ? (ts > 1e10 ? ts : ts * 1000) : 0;
   }).filter(Boolean);
-  const lastActiveTs = timestamps.length ? Math.max(...timestamps) : 0;
-  const lastActiveDate = lastActiveTs ? new Date(lastActiveTs).toISOString().split('T')[0] : 'Unknown';
-  const activeRecently = lastActiveTs >= thirtyDaysAgo;
+  const lastActiveTs = allTimestamps.length ? Math.max(...allTimestamps) : 0;
+  if (lastActiveTs < thirtyDaysAgo) return null;
+  const lastActiveDate = new Date(lastActiveTs).toISOString().split('T')[0];
 
-  if (!activeRecently) return null;
-
-  // Win/loss on qualifying trades
-  let wins = 0;
-  let losses = 0;
-  let totalPnl = 0;
-  let totalEntryPrice = 0;
+  // Win/loss: use cashPnl on qualifying trades (positive = win, negative = loss)
+  // Only count as resolved if cashPnl is non-zero
+  let wins = 0, losses = 0, totalEntryPrice = 0;
   const categories = {};
 
   for (const t of qualifying) {
-    // outcome: 1 = win, 0 = loss; or check resolvedOutcome/side
-    const outcome = t.outcome ?? t.resolvedOutcome ?? t.profit;
-    const pnl = parsePrice(t.profit || t.pnl || t.realizedPnl);
-    const price = parsePrice(t.price || t.outcomePrice);
-    const category = t.category || t.marketCategory || 'Unknown';
+    const pnl = parseFloat(t.cashPnl ?? t.realizedPnl ?? 'NaN');
+    const price = parseFloat(t.price ?? t.avgPrice ?? 0);
+    totalEntryPrice += isNaN(price) ? 0 : price;
 
-    if (pnl !== null) totalPnl += pnl;
+    if (!isNaN(pnl) && pnl > 0) wins++;
+    else if (!isNaN(pnl) && pnl < 0) losses++;
+    // pnl === 0 or NaN → unresolved, skip from win rate
 
-    if (price !== null) totalEntryPrice += price;
-
-    if (outcome === 1 || outcome === true || outcome === 'yes' || (pnl !== null && pnl > 0)) {
-      wins++;
-    } else if (outcome === 0 || outcome === false || outcome === 'no' || (pnl !== null && pnl < 0)) {
-      losses++;
-    }
-
-    categories[category] = (categories[category] || 0) + 1;
+    const cat = t.category || t.eventCategory || t.marketCategory || 'Unknown';
+    categories[cat] = (categories[cat] || 0) + 1;
   }
 
-  // Overall PnL from all trades
+  // Overall PnL across ALL trades
   let overallPnl = 0;
   for (const t of trades) {
-    const pnl = parsePrice(t.profit || t.pnl || t.realizedPnl);
-    if (pnl !== null) overallPnl += pnl;
+    const pnl = parseFloat(t.cashPnl ?? t.realizedPnl ?? 'NaN');
+    if (!isNaN(pnl)) overallPnl += pnl;
   }
 
-  const totalQualifying = qualifying.length;
-  const resolvedQualifying = wins + losses;
-  const winRate = resolvedQualifying > 0 ? wins / resolvedQualifying : 0;
-  const avgEntryPrice = totalQualifying > 0 ? totalEntryPrice / totalQualifying : 0;
-
-  // Top categories
+  const resolved = wins + losses;
+  const winRate = resolved > 0 ? wins / resolved : 0;
+  const avgEntryPrice = qualifying.length ? totalEntryPrice / qualifying.length : 0;
   const topCategories = Object.entries(categories)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([cat]) => cat)
-    .join(', ');
+    .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c]) => c).join(', ') || 'Unknown';
 
   return {
     address,
-    totalQualifying,
+    totalQualifying: qualifying.length,
     wins,
     losses,
     winRate,
@@ -299,50 +251,46 @@ function evaluateWallet(address, trades, shortResolutionMarketIds) {
     overallPnl,
     topCategories,
     lastActiveDate,
-    activeRecently,
   };
 }
 
-function assignTiers(wallet) {
+function assignTiers(w) {
   const tiers = [];
-  const { totalQualifying, winRate, overallPnl, activeRecently } = wallet;
-  if (!activeRecently || overallPnl <= 0) return tiers;
-
-  if (totalQualifying >= 30 && winRate >= 0.60) tiers.push(1);
-  if (totalQualifying >= 20 && winRate >= 0.55) tiers.push(2);
-  if (totalQualifying >= 15 && winRate >= 0.50) tiers.push(3);
+  if (w.overallPnl <= 0) return tiers;
+  if (w.totalQualifying >= 30 && w.winRate >= 0.60) tiers.push(1);
+  if (w.totalQualifying >= 20 && w.winRate >= 0.55) tiers.push(2);
+  if (w.totalQualifying >= 15 && w.winRate >= 0.50) tiers.push(3);
   return tiers;
 }
 
-// ── Main scan ─────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function runScan() {
   log('=== Polymarket Wallet Scanner starting ===');
 
-  const [leaderboardWallets, shortMarkets] = await Promise.all([
+  // Run leaderboard + market fetches in parallel
+  const [leaderboardWallets, shortConditionIds] = await Promise.all([
     fetchLeaderboard(1000),
-    fetchMarketsWithShortResolution(14),
+    fetchShortResolutionMarketIds(14),
   ]);
 
-  const shortMarketIds = shortMarkets.map(m => m.id).filter(Boolean);
-  const activeTraders = await fetchActiveTraders(shortMarketIds);
-
-  // Combine and deduplicate
-  const allWallets = [...new Set([...leaderboardWallets, ...activeTraders])];
-  log(`Total unique wallets to evaluate: ${allWallets.length}`);
+  const allWallets = leaderboardWallets; // leaderboard is the primary source
+  log(`Total wallets to evaluate: ${allWallets.length}`);
 
   const tier1 = [], tier2 = [], tier3 = [];
   const seen = new Map();
-
   let processed = 0;
+
   for (const address of allWallets) {
     processed++;
-    if (processed % 50 === 0) log(`Progress: ${processed}/${allWallets.length}`);
+    if (processed % 50 === 0) {
+      log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length}`);
+    }
 
     try {
       const trades = await fetchWalletTrades(address);
       if (!trades.length) continue;
 
-      const stats = evaluateWallet(address, trades, shortMarketIds);
+      const stats = evaluateWallet(address, trades, shortConditionIds);
       if (!stats) continue;
 
       const tiers = assignTiers(stats);
@@ -350,35 +298,26 @@ async function runScan() {
 
       const record = { ...stats, tiers };
       seen.set(address, record);
-
       if (tiers.includes(1)) tier1.push(record);
       if (tiers.includes(2)) tier2.push(record);
       if (tiers.includes(3)) tier3.push(record);
-
-      await sleep(200);
     } catch (e) {
       logError(`Failed to evaluate ${address}`, e);
     }
+
+    await sleep(250);
   }
 
-  // Multi-tier wallets (appear in 2+ tiers)
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
-
-  // Sort each tier by win rate desc
   const sortFn = (a, b) => b.winRate - a.winRate || b.totalQualifying - a.totalQualifying;
-  tier1.sort(sortFn);
-  tier2.sort(sortFn);
-  tier3.sort(sortFn);
-  multiTier.sort(sortFn);
+  [tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
 
   const results = {
     scanTime: new Date().toISOString(),
-    tier1,
-    tier2,
-    tier3,
-    multiTier,
+    tier1, tier2, tier3, multiTier,
     stats: {
       walletsScanned: allWallets.length,
+      walletsEvaluated: processed,
       tier1Count: tier1.length,
       tier2Count: tier2.length,
       tier3Count: tier3.length,
@@ -386,16 +325,15 @@ async function runScan() {
     },
   };
 
-  // Ensure data directory exists
   const dataDir = path.join(__dirname, 'data');
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(DATA_FILE, JSON.stringify(results, null, 2));
 
-  log(`=== Scan complete. T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length} ===`);
+  log(`=== Scan complete: T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length} ===`);
   return results;
 }
 
 runScan().catch(e => {
-  logError('Fatal error in scanner', e);
+  logError('Fatal scanner error', e);
   process.exit(1);
 });
