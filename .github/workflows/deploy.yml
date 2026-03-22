@@ -22,7 +22,16 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Deploy to VPS
+      - name: Rsync files to VPS
+        run: |
+          rsync -az --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='data' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=1 -o ServerAliveCountMax=120" \
+            ./ ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/polymarket-scanner/
+
+      - name: Restart services on VPS
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
@@ -35,18 +44,10 @@ jobs:
 
                echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy triggered" >> "$LOG"
 
-               # Clone or pull
-               if [ ! -d "$APP_DIR/.git" ]; then
-                 git clone --branch claude/polymarket-wallet-scanner-ofqu0 \
-                   https://github.com/justintilts333/poly.git "$APP_DIR" || exit 1
-               fi
                cd "$APP_DIR"
-               git fetch origin claude/polymarket-wallet-scanner-ofqu0 || exit 1
-               git reset --hard origin/claude/polymarket-wallet-scanner-ofqu0 || exit 1
                npm install --production || exit 1
 
-               # Kill any running scanner FIRST, then start a new one fully detached
-               # (do this before pm2 so scanner is protected by nohup even if SSH drops)
+               # Kill any running scanner and start a fresh one (fully detached)
                pkill -KILL -f "node.*scanner.js" 2>/dev/null || true
                rm -f /tmp/polymarket-scanner.lock
                nohup node "$APP_DIR/scanner.js" </dev/null >> "$LOG" 2>&1 &
