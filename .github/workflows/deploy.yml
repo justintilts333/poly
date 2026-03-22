@@ -60,7 +60,7 @@ jobs:
                pm2 save
 
                echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy complete" >> "$LOG"
-               pm2 status polymarket-scanner
+               pm2 status polymarket-scanner || true
 
                # Kill stale scanner + restart fresh (fire-and-forget)
                pkill -f "node.*scanner.js" 2>/dev/null || true
