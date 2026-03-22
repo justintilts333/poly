@@ -201,12 +201,15 @@ async function fetchMarketHolders(topMarkets) {
       const url = `${DATA_API}/holders?market=${conditionId}&limit=100`;
       const data = await fetchJSON(url, 2, 1000);
       const rows = Array.isArray(data) ? data : (data.data || data.holders || []);
+      if (i === 0) {
+        log(`  [DEBUG] holders url=${url} type=${typeof data} isArr=${Array.isArray(data)} rows=${rows.length} sample=${JSON.stringify(data).slice(0, 300)}`);
+      }
       for (const row of rows) {
         const addr = row.proxyWallet || row.proxy_wallet || row.user || row.address || row.holder;
         if (addr) wallets.add(addr.toLowerCase());
       }
     } catch (e) {
-      // skip markets with no holders data
+      if (i === 0) logError(`Holders fetch (market ${conditionId})`, e);
     }
     if ((i + 1) % 50 === 0) {
       log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets so far`);
