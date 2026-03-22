@@ -41,7 +41,7 @@ jobs:
               -o ServerAliveInterval=1 \
               -o ServerAliveCountMax=120 \
               ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
-              'pkill -KILL -f "node.*scanner.js" 2>/dev/null; rm -f /tmp/polymarket-scanner.lock; nohup node /opt/polymarket-scanner/scanner.js </dev/null >> /var/log/polymarket-scanner.log 2>&1 & echo "scanner_pid=$!"'
+              'bash /opt/polymarket-scanner/scripts/restart.sh'
 
       - name: Verify dashboard is up
         run: |
