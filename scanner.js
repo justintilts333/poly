@@ -187,7 +187,7 @@ async function fetchWalletTrades(address) {
   while (true) {
     try {
       const url = `${DATA_API}/activity?user=${address}&limit=${pageSize}&offset=${offset}&type=TRADE`; // no /v1
-      const data = await fetchJSON(url);
+      const data = await fetchJSON(url, 2, 1000);
       const rows = Array.isArray(data) ? data : (data.data || data.activities || []);
       if (!rows.length) break;
       trades.push(...rows);
@@ -195,6 +195,7 @@ async function fetchWalletTrades(address) {
       offset += pageSize;
       await sleep(200);
     } catch (e) {
+      if (e.message && e.message.includes('HTTP 400')) break; // past end of data
       logError(`Trade fetch failed for ${address}`, e);
       break;
     }
