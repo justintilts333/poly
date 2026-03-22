@@ -48,7 +48,6 @@ jobs:
                # Kill any running scanner FIRST, then start a new one fully detached
                # (do this before pm2 so scanner is protected by nohup even if SSH drops)
                pkill -KILL -f "node.*scanner.js" 2>/dev/null || true
-               sleep 2
                rm -f /tmp/polymarket-scanner.lock
                nohup node "$APP_DIR/scanner.js" </dev/null >> "$LOG" 2>&1 &
                SCANNER_PID=$!
