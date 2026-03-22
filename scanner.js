@@ -104,9 +104,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const FALCON_SSE   = 'https://narrative.agent.heisenberg.so/sse';
 const FALCON_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc5MzgyNTE2LCJpYXQiOjE3NzQxOTg1MTYsImp0aSI6ImY0MzVmZTYxZTYxODQxMWE5YWMxYTNkZDI4NzRlNGM1IiwidXNlcl9pZCI6Njk4LCJzY29wZSI6ImxhdW5jaHBhZDphZ2VudC1yZWFkLHJldHJpZXZlcjplY2hvLWdlbmVyYXRpb24scmV0cmlldmVyOmZlYXR1cmUtZXh0cmFjdGlvbix1c2VyOnJlYWQscmV0cmlldmVyOmFnZW50LW9wdGlvbi1yZXRyaWV2YWwsbGF1bmNocGFkOmFnZW50LWNyZWF0aW9uLGxhdW5jaHBhZDphZ2VudC11cGRhdGUsdXNlcjp3cml0ZSxyZXRyaWV2ZXI6c2VtYW50aWMtcmV0cmlldmFsLGxhdW5jaHBhZDplY2hvLXN0eWxlLWNyZWF0aW9uIiwidG9rZW5fbmFtZSI6ImJhc2VfbG9naW4ifQ.D9ykx0Zi01rdR4noo7gq85GXR0Qfp-Qp0Mgw3eCYFFY';
 
-// Calls the Falcon SSE endpoint and returns an array of parsed event objects:
-// [{type: string|null, data: any}, ...]
-// Each event corresponds to one blank-line-delimited SSE block.
+// Calls the Falcon SSE endpoint and returns an array of parsed event objects.
+// SSE is a GET-based protocol; params are sent as a JSON query string.
+// Falls back to POST if the GET returns 405 (discovery on first call).
+let _falconMethod = 'GET'; // updated at runtime if 405
+
 function callFalconSSE(agentId, params, pagination, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const bodyObj = {
@@ -115,21 +117,42 @@ function callFalconSSE(agentId, params, pagination, timeoutMs = 60000) {
       formatter_config: { format_type: 'raw' },
     };
     if (pagination) bodyObj.pagination = pagination;
-    const bodyStr = JSON.stringify(bodyObj);
+
+    const attempt = (method) => {
+      let path, bodyStr;
+      const hdrs = {
+        'Authorization': `Bearer ${FALCON_TOKEN}`,
+        'Accept': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+      };
+
+      if (method === 'GET') {
+        // Encode the full request body as a JSON query param
+        path = '/sse?body=' + encodeURIComponent(JSON.stringify(bodyObj));
+      } else {
+        bodyStr = JSON.stringify(bodyObj);
+        hdrs['Content-Type'] = 'application/json';
+        hdrs['Content-Length'] = Buffer.byteLength(bodyStr);
+        path = '/sse';
+      }
 
     const req = https.request({
       hostname: 'narrative.agent.heisenberg.so',
-      path: '/sse',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${FALCON_TOKEN}`,
-        'Content-Length': Buffer.byteLength(bodyStr),
-        'Accept': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-      },
+        path, method, headers: hdrs,
       timeout: timeoutMs,
     }, (res) => {
+        // If GET returns 405, flip to POST for this and all future calls
+        if (res.statusCode === 405 && method === 'GET') {
+          res.resume();
+          _falconMethod = 'POST';
+          return attempt('POST');
+        }
+        // If POST returns 405, try GET
+        if (res.statusCode === 405 && method === 'POST') {
+          res.resume();
+          _falconMethod = 'GET';
+          return attempt('GET');
+        }
       if (res.statusCode !== 200) {
         let errBody = '';
         res.on('data', c => { errBody += c; });
@@ -176,10 +199,13 @@ function callFalconSSE(agentId, params, pagination, timeoutMs = 60000) {
       });
     });
 
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error(`SSE timeout agent=${agentId}`)); });
-    req.write(bodyStr);
-    req.end();
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error(`SSE timeout agent=${agentId}`)); });
+      if (bodyStr) req.write(bodyStr);
+      req.end();
+    }; // end attempt
+
+    attempt(_falconMethod);
   });
 }
 
