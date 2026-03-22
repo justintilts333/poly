@@ -9,7 +9,7 @@ const LOG_FILE = '/var/log/polymarket-scanner.log';
 const DATA_FILE = path.join(__dirname, 'data', 'results.json');
 const LOCK_FILE = '/tmp/polymarket-scanner.lock';
 
-// ── Single-instance lock (atomic: wx flag fails if file exists) ───────────────
+// ── Single-instance lock ───────────────────────────────────────────────────────
 function acquireLock() {
   try {
     const fd = fs.openSync(LOCK_FILE, 'wx');
@@ -44,7 +44,7 @@ process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch (_) {} });
 process.on('SIGINT', () => process.exit());
 process.on('SIGTERM', () => process.exit());
 
-// ── Logging ───────────────────────────────────────────────────────────────────
+// ── Logging ────────────────────────────────────────────────────────────────────
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   process.stdout.write(line);
@@ -56,20 +56,20 @@ function logError(msg, err) {
   try { fs.appendFileSync(LOG_FILE, line); } catch (_) {}
 }
 
-// ── HTTP helpers ──────────────────────────────────────────────────────────────
+// ── HTTP helper ────────────────────────────────────────────────────────────────
 function fetchJSON(url, retries = 3, delayMs = 2000) {
   return new Promise((resolve, reject) => {
     const attempt = (n, delay) => {
       const req = https.get(url, {
         headers: {
           'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (compatible; PolymarketScanner/1.0)',
+          'User-Agent': 'Mozilla/5.0 (compatible; PolymarketScanner/2.0)',
         },
         timeout: 30000,
       }, (res) => {
         if (res.statusCode === 429) {
           const wait = parseInt(res.headers['retry-after'] || '10', 10) * 1000;
-          log(`Rate limited, waiting ${wait}ms`);
+          log(`Rate limited (429), waiting ${wait}ms`);
           res.resume();
           setTimeout(() => attempt(n, delay), wait);
           return;
@@ -86,8 +86,15 @@ function fetchJSON(url, retries = 3, delayMs = 2000) {
           catch (e) { reject(new Error(`JSON parse error: ${e.message}`)); }
         });
       });
-      req.on('error', err => { if (n > 0) setTimeout(() => attempt(n - 1, delay * 2), delay); else reject(err); });
-      req.on('timeout', () => { req.destroy(); if (n > 0) setTimeout(() => attempt(n - 1, delay * 2), delay); else reject(new Error(`Timeout: ${url}`)); });
+      req.on('error', err => {
+        if (n > 0) setTimeout(() => attempt(n - 1, delay * 2), delay);
+        else reject(err);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        if (n > 0) setTimeout(() => attempt(n - 1, delay * 2), delay);
+        else reject(new Error(`Timeout: ${url}`));
+      });
     };
     attempt(retries, delayMs);
   });
@@ -95,220 +102,59 @@ function fetchJSON(url, retries = 3, delayMs = 2000) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Falcon SSE ─────────────────────────────────────────────────────────────────
-// All Falcon calls go to POST /sse, switching agent_id for different datasets.
-// The server responds with Server-Sent Events (text/event-stream).
-// Format: lines of "data: <json>" separated by blank lines.
-// We collect all events and return the parsed array.
+// ── API base URLs ──────────────────────────────────────────────────────────────
+const DATA_API        = 'https://data-api.polymarket.com';
+const GAMMA_API       = 'https://gamma-api.polymarket.com';
+const LEADERBOARD_API = 'https://leaderboard-api.polymarket.com';
 
-const FALCON_SSE   = 'https://narrative.agent.heisenberg.so/sse';
-const FALCON_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc5MzgyNTE2LCJpYXQiOjE3NzQxOTg1MTYsImp0aSI6ImY0MzVmZTYxZTYxODQxMWE5YWMxYTNkZDI4NzRlNGM1IiwidXNlcl9pZCI6Njk4LCJzY29wZSI6ImxhdW5jaHBhZDphZ2VudC1yZWFkLHJldHJpZXZlcjplY2hvLWdlbmVyYXRpb24scmV0cmlldmVyOmZlYXR1cmUtZXh0cmFjdGlvbix1c2VyOnJlYWQscmV0cmlldmVyOmFnZW50LW9wdGlvbi1yZXRyaWV2YWwsbGF1bmNocGFkOmFnZW50LWNyZWF0aW9uLGxhdW5jaHBhZDphZ2VudC11cGRhdGUsdXNlcjp3cml0ZSxyZXRyaWV2ZXI6c2VtYW50aWMtcmV0cmlldmFsLGxhdW5jaHBhZDplY2hvLXN0eWxlLWNyZWF0aW9uIiwidG9rZW5fbmFtZSI6ImJhc2VfbG9naW4ifQ.D9ykx0Zi01rdR4noo7gq85GXR0Qfp-Qp0Mgw3eCYFFY';
-
-// Calls the Falcon SSE endpoint and returns an array of parsed event objects.
-// SSE is a GET-based protocol; params are sent as a JSON query string.
-// Falls back to POST if the GET returns 405 (discovery on first call).
-let _falconMethod = 'GET'; // updated at runtime if 405
-
-function callFalconSSE(agentId, params, pagination, timeoutMs = 60000) {
-  return new Promise((resolve, reject) => {
-    const bodyObj = {
-      agent_id: agentId,
-      params,
-      formatter_config: { format_type: 'raw' },
-    };
-    if (pagination) bodyObj.pagination = pagination;
-
-    const attempt = (method) => {
-      let path, bodyStr;
-      const hdrs = {
-        'Authorization': `Bearer ${FALCON_TOKEN}`,
-        'Accept': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-      };
-
-      if (method === 'GET') {
-        // Encode the full request body as a JSON query param
-        path = '/sse?body=' + encodeURIComponent(JSON.stringify(bodyObj));
-      } else {
-        bodyStr = JSON.stringify(bodyObj);
-        hdrs['Content-Type'] = 'application/json';
-        hdrs['Content-Length'] = Buffer.byteLength(bodyStr);
-        path = '/sse';
-      }
-
-    const req = https.request({
-      hostname: 'narrative.agent.heisenberg.so',
-        path, method, headers: hdrs,
-      timeout: timeoutMs,
-    }, (res) => {
-        // If GET returns 405, flip to POST for this and all future calls
-        if (res.statusCode === 405 && method === 'GET') {
-          res.resume();
-          _falconMethod = 'POST';
-          return attempt('POST');
-        }
-        // If POST returns 405, try GET
-        if (res.statusCode === 405 && method === 'POST') {
-          res.resume();
-          _falconMethod = 'GET';
-          return attempt('GET');
-        }
-      if (res.statusCode !== 200) {
-        let errBody = '';
-        res.on('data', c => { errBody += c; });
-        res.on('end', () => reject(new Error(`Falcon HTTP ${res.statusCode}: ${errBody.slice(0, 300)}`)));
-        return;
-      }
-
-      const allEvents = [];
-      let buf = '';
-      let curType = null;
-      let curDataLines = [];
-
-      const flushEvent = () => {
-        if (!curDataLines.length) return;
-        const joined = curDataLines.join('\n').trim();
-        curType = null;
-        curDataLines = [];
-        if (!joined || joined === '[DONE]') return;
-        try { allEvents.push(JSON.parse(joined)); }
-        catch (_) { allEvents.push(joined); }
-      };
-
-      res.on('data', chunk => {
-        buf += chunk.toString();
-        const lines = buf.split('\n');
-        buf = lines.pop(); // keep incomplete trailing line
-        for (const line of lines) {
-          const trimmed = line.replace(/\r$/, '');
-          if (trimmed === '') {
-            flushEvent();
-          } else if (trimmed.startsWith('event:')) {
-            curType = trimmed.slice(6).trim(); // eslint-disable-line no-unused-vars
-          } else if (trimmed.startsWith('data:')) {
-            curDataLines.push(trimmed.slice(5).trim());
-          }
-          // ignore id:, retry:, comment lines
-        }
-      });
-
-      res.on('end', () => {
-        if (buf.trim()) curDataLines.push(buf.trim());
-        flushEvent();
-        resolve(allEvents);
-      });
-    });
-
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error(`SSE timeout agent=${agentId}`)); });
-      if (bodyStr) req.write(bodyStr);
-      req.end();
-    }; // end attempt
-
-    attempt(_falconMethod);
-  });
-}
-
-// Extract the row array (or single object) from the collected SSE events.
-// The Falcon API may send data across one or many events in various envelope shapes.
-// We search from last to first since the final event is most likely the complete result.
-function sseExtract(events) {
-  if (!events || !events.length) return null;
-
-  // Log the raw shape on the first call so we can verify field names
-  // (this log line will appear once per agent_id per run in the VPS log)
-  const last = events[events.length - 1];
-
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
-
-    // Direct array
-    if (Array.isArray(ev)) return ev;
-
-    // Common envelope keys
-    const rows = ev.rows ?? ev.data ?? ev.results ?? ev.traders ?? ev.wallets ?? ev.trades;
-    if (Array.isArray(rows)) return rows;
-
-    // Single-object wallet response (Wallet 360)
-    if (
-      typeof ev.win_rate === 'number' || typeof ev.winRate === 'number' ||
-      typeof ev.total_pnl === 'number' || typeof ev.pnl === 'number' ||
-      ev.wallet_address || ev.proxyWallet || ev.proxy_wallet
-    ) return ev;
-
-    // Nested result
-    const inner = ev.result ?? ev.content ?? ev.payload;
-    if (inner && typeof inner === 'object') return inner;
-  }
-
-  // Last resort: return the last event as-is
-  return last ?? null;
-}
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-const DATA_API   = 'https://data-api.polymarket.com';
-const GAMMA_API  = 'https://gamma-api.polymarket.com';
-
-// ── 1. Falcon wallet discovery (agents 584 + 579) ────────────────────────────
-// Agent 584 = Falcon Score Leaderboard (primary)
-// Agent 579 = Official Leaderboard (secondary)
-// Target: 2000+ high-quality trader wallets as evaluation candidates.
-async function fetchFalconCandidates() {
-  log('Fetching Falcon candidate wallets (agent 584 primary, 579 secondary)...');
+// ── STEP 0: Wallet discovery via leaderboard ──────────────────────────────────
+// Fetches multiple windows (all, 1m, 1w) to gather a broad candidate set.
+async function fetchLeaderboardCandidates() {
+  log('Fetching leaderboard candidates...');
   const wallets = new Set();
-  const PAGE = 100;
+  const windows = ['all', '1m', '1w'];
+  const limit = 100;
 
-  for (const agentId of [584, 579]) {
+  for (const window of windows) {
     let offset = 0;
-    let debugLogged = false;
-    while (true) {
+    let pages = 0;
+    while (pages < 20) { // cap at 2000 per window
       try {
-        const events = await callFalconSSE(
-          agentId,
-          { wallet_address: 'ALL' },
-          { limit: PAGE, offset },
-          45000
-        );
-        const rows = sseExtract(events);
+        const url = `${LEADERBOARD_API}/l/rankings?window=${window}&limit=${limit}&offset=${offset}`;
+        const data = await fetchJSON(url, 3, 2000);
+        const rows = Array.isArray(data) ? data : (data.data || data.rankings || data.results || []);
+        if (!rows.length) break;
 
-        // Log raw shape once per agent for field-name visibility
-        if (!debugLogged) {
-          debugLogged = true;
-          const sample = Array.isArray(rows) ? rows[0] : rows;
-          log(`  [DEBUG] agent=${agentId} response keys: ${sample ? Object.keys(sample).join(',') : 'null'} | events=${events.length}`);
+        if (offset === 0) {
+          log(`  [DEBUG] leaderboard window=${window} keys: ${Object.keys(rows[0] || {}).join(',')}`);
         }
-
-        if (!Array.isArray(rows) || !rows.length) break;
 
         for (const row of rows) {
-          const addr =
-            row.proxyWallet ?? row.proxy_wallet ?? row.wallet ??
-            row.wallet_address ?? row.address ?? row.user;
+          const addr = row.proxyWallet ?? row.proxy_wallet ?? row.wallet ?? row.address ?? row.user;
           if (addr && typeof addr === 'string') wallets.add(addr.toLowerCase());
         }
-        log(`  agent=${agentId} offset=${offset}: ${rows.length} rows → ${wallets.size} wallets`);
-        if (rows.length < PAGE) break;
-        offset += PAGE;
-        await sleep(400);
+        log(`  Leaderboard window=${window} offset=${offset}: ${rows.length} rows → ${wallets.size} total`);
+        if (rows.length < limit) break;
+        offset += limit;
+        pages++;
+        await sleep(300);
       } catch (e) {
-        logError(`Falcon candidates agent=${agentId} offset=${offset}`, e);
+        logError(`Leaderboard window=${window} offset=${offset}`, e);
         break;
       }
     }
-    log(`  After agent ${agentId}: ${wallets.size} wallets`);
-    await sleep(800);
+    await sleep(500);
   }
 
-  log(`Falcon candidates complete: ${wallets.size} wallets`);
+  log(`Leaderboard candidates: ${wallets.size} wallets`);
   return [...wallets];
 }
 
-// ── 2. Short-resolution markets ───────────────────────────────────────────────
-async function fetchShortResolutionMarketIds(maxDays = 14) {
+// ── STEP 0b: Short-resolution markets ─────────────────────────────────────────
+async function fetchShortResolutionMarkets(maxDays = 14) {
   log(`Fetching markets resolving within ${maxDays} days...`);
   const conditionIds = new Set();
-  const allShortMarkets = [];
+  const allMarkets = [];
   const pageSize = 500;
   let offset = 0;
   const deadlineCutoff = Date.now() + maxDays * 86400000;
@@ -330,7 +176,7 @@ async function fetchShortResolutionMarketIds(maxDays = 14) {
           if (cid) {
             conditionIds.add(cid.toLowerCase());
             const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
-            allShortMarkets.push({ conditionId: cid.toLowerCase(), volume: vol });
+            allMarkets.push({ conditionId: cid.toLowerCase(), endTs, volume: vol });
             added++;
           }
         }
@@ -345,13 +191,13 @@ async function fetchShortResolutionMarketIds(maxDays = 14) {
     }
   }
 
-  allShortMarkets.sort((a, b) => b.volume - a.volume);
-  const topMarkets = allShortMarkets.slice(0, 300);
-  log(`Found ${conditionIds.size} short-resolution conditionIds (top ${topMarkets.length} by volume)`);
+  allMarkets.sort((a, b) => b.volume - a.volume);
+  const topMarkets = allMarkets.slice(0, 300);
+  log(`Short-resolution markets: ${conditionIds.size} conditionIds (top ${topMarkets.length} by volume)`);
   return { conditionIds, topMarkets };
 }
 
-// ── 3. Holders from top markets ───────────────────────────────────────────────
+// ── STEP 0c: Market holders ────────────────────────────────────────────────────
 async function fetchMarketHolders(topMarkets) {
   log(`Fetching holders from top ${topMarkets.length} markets...`);
   const wallets = new Set();
@@ -376,189 +222,262 @@ async function fetchMarketHolders(topMarkets) {
     await sleep(150);
   }
 
-  log(`Market holder scan complete: ${wallets.size} wallets`);
+  log(`Market holder scan: ${wallets.size} wallets`);
   return wallets;
 }
 
-// ── 4. Wallet 360 evaluation (agent 581) ──────────────────────────────────────
-// Returns normalised metrics or null if the response is unusable.
-let wallet360FieldsLogged = false;
+// ── Trade history via data-api ─────────────────────────────────────────────────
+// Fetches all trade activity for a wallet. Returns raw trade rows.
+let activityFieldsLogged = false;
 
-function parseWallet360(raw) {
-  if (!raw || typeof raw !== 'object') return null;
+async function fetchWalletTrades(address, maxTrades = 1000) {
+  const trades = [];
+  const limit = 500;
+  let offset = 0;
 
-  // Log field names once so we know the exact shape
-  if (!wallet360FieldsLogged) {
-    wallet360FieldsLogged = true;
-    log(`  [DEBUG] Wallet360 field names: ${Object.keys(raw).join(', ')}`);
-  }
+  while (trades.length < maxTrades) {
+    try {
+      const url = `${DATA_API}/activity?user=${address}&limit=${limit}&offset=${offset}&sortBy=TIMESTAMP&ascending=false`;
+      const data = await fetchJSON(url, 2, 1500);
+      const rows = Array.isArray(data) ? data : (data.data || data.activity || data.trades || []);
+      if (!rows.length) break;
 
-  const get = (...keys) => {
-    for (const k of keys) if (raw[k] !== undefined && raw[k] !== null) return raw[k];
-    return undefined;
-  };
+      if (!activityFieldsLogged && rows.length > 0) {
+        activityFieldsLogged = true;
+        log(`  [DEBUG] activity field names: ${Object.keys(rows[0]).join(', ')}`);
+      }
 
-  const winRateRaw = parseFloat(get('win_rate', 'winRate', 'win_pct', 'wins_pct') ?? 'NaN');
-  // Some APIs return win rate as 0–100 rather than 0–1
-  const winRate = winRateRaw > 1 ? winRateRaw / 100 : winRateRaw;
-
-  const tradeCount = parseInt(
-    get('total_trades', 'trade_count', 'tradeCount', 'num_trades', 'trades') ?? '0',
-    10
-  );
-
-  const pnl = parseFloat(get('total_pnl', 'pnl', 'net_pnl', 'realized_pnl', 'profit_loss') ?? 'NaN');
-
-  const lastActiveRaw = get(
-    'last_active', 'lastActive', 'last_trade_date', 'last_trade',
-    'last_activity', 'lastTrade', 'last_traded'
-  );
-  let lastActiveTs = 0;
-  if (lastActiveRaw) {
-    if (typeof lastActiveRaw === 'number') {
-      lastActiveTs = lastActiveRaw > 1e10 ? lastActiveRaw : lastActiveRaw * 1000;
-    } else {
-      lastActiveTs = new Date(lastActiveRaw).getTime() || 0;
+      trades.push(...rows);
+      if (rows.length < limit) break;
+      offset += limit;
+      await sleep(200);
+    } catch (e) {
+      // Non-fatal: return whatever we have
+      break;
     }
   }
 
-  return { winRate, tradeCount, pnl, lastActiveTs, raw };
+  return trades;
 }
 
-function assignTiers(winRate, tradeCount, pnl, lastActiveTs) {
-  const tiers = [];
-  if (isNaN(pnl) || pnl <= 0) return tiers;
-  const thirtyDaysAgo = Date.now() - 30 * 86400000;
-  if (lastActiveTs < thirtyDaysAgo) return tiers;
-  if (tradeCount >= 30 && winRate >= 0.60) tiers.push(1);
-  if (tradeCount >= 20 && winRate >= 0.55) tiers.push(2);
-  if (tradeCount >= 15 && winRate >= 0.50) tiers.push(3);
-  return tiers;
-}
+// ── STEP 1: Bot filter ─────────────────────────────────────────────────────────
+// Discard wallets that look like bots.
+// Criteria (applied to raw all-trades list before any other filtering):
+//   a) Total raw trades > 2000 (thousands of micro-trades)
+//   b) All trade sizes suspiciously uniform (stdev < 1% of mean on usdcSize)
+function isBotWallet(allTrades) {
+  if (allTrades.length > 2000) return true;
 
-// ── 5. Trade verification (agent 556) ─────────────────────────────────────────
-// For tier-passing wallets: confirm they have BUY trades with price < $0.50
-// in sub-14-day resolution markets.
-let trades556FieldsLogged = false;
+  // Check trade size uniformity on available trades
+  const sizes = allTrades
+    .map(t => parseFloat(t.usdcSize ?? t.amount ?? t.size ?? 0))
+    .filter(s => s > 0);
 
-function parseFalconTrades(raw) {
-  if (!raw) return [];
-  const rows = Array.isArray(raw)
-    ? raw
-    : (raw.trades ?? raw.data ?? raw.rows ?? raw.results ?? []);
-  if (!Array.isArray(rows)) return [];
-
-  if (!trades556FieldsLogged && rows.length > 0) {
-    trades556FieldsLogged = true;
-    log(`  [DEBUG] agent556 trade field names: ${Object.keys(rows[0]).join(', ')}`);
+  if (sizes.length >= 10) {
+    const mean = sizes.reduce((a, b) => a + b, 0) / sizes.length;
+    const variance = sizes.reduce((a, v) => a + Math.pow(v - mean, 2), 0) / sizes.length;
+    const stdev = Math.sqrt(variance);
+    if (mean > 0 && stdev / mean < 0.01) return true; // <1% coefficient of variation
   }
-  return rows;
+
+  return false;
 }
 
-function buildRecord(address, m360, trades, shortConditionIds, tiers) {
-  const qualifying = trades.filter(t => {
+// ── STEP 2: Activity filter ────────────────────────────────────────────────────
+// Returns the most recent trade timestamp in ms, or 0 if no trades.
+function getLastTradeTs(allTrades) {
+  let latest = 0;
+  for (const t of allTrades) {
+    let ts = t.timestamp ?? t.createdAt ?? t.created_at ?? t.time ?? 0;
+    if (typeof ts === 'string') ts = new Date(ts).getTime() || 0;
+    if (typeof ts === 'number' && ts < 1e12) ts *= 1000; // seconds → ms
+    if (ts > latest) latest = ts;
+  }
+  return latest;
+}
+
+// ── STEP 3: Trade-level filter ─────────────────────────────────────────────────
+// Keep only: BUY side, price < $0.50, conditionId in short-resolution set.
+function filterQualifyingTrades(allTrades, shortConditionIds) {
+  return allTrades.filter(t => {
     const side = (t.side ?? t.trade_side ?? t.type ?? '').toUpperCase();
     if (side !== 'BUY') return false;
-    const price = parseFloat(t.price ?? t.avg_price ?? t.avgPrice ?? 1);
+    const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
     if (isNaN(price) || price >= 0.50) return false;
-    const cid = (t.conditionId ?? t.condition_id ?? t.market ?? t.market_id ?? '').toLowerCase();
-    return shortConditionIds.size === 0 || shortConditionIds.has(cid);
+    const cid = (t.conditionId ?? t.condition_id ?? t.market ?? t.marketId ?? '').toLowerCase();
+    // If shortConditionIds is empty (markets API failed) allow all
+    if (shortConditionIds.size > 0 && !shortConditionIds.has(cid)) return false;
+    return true;
   });
+}
 
-  let wins = 0, losses = 0, totalEntryPrice = 0;
-  const categories = {};
-  for (const t of qualifying) {
-    const pnl = parseFloat(t.cashPnl ?? t.cash_pnl ?? t.pnl ?? t.realized_pnl ?? 'NaN');
-    const price = parseFloat(t.price ?? t.avg_price ?? t.avgPrice ?? 0);
-    totalEntryPrice += isNaN(price) ? 0 : price;
-    if (!isNaN(pnl) && pnl > 0) wins++;
-    else if (!isNaN(pnl) && pnl < 0) losses++;
-    const cat = t.category ?? t.market_category ?? t.event_category ?? t.eventCategory ?? 'Unknown';
-    categories[cat] = (categories[cat] || 0) + 1;
+// ── STEP 4: Metric calculation ─────────────────────────────────────────────────
+// All metrics computed on the qualifying subset.
+function calcMetrics(qualifyingTrades, allTrades) {
+  if (!qualifyingTrades.length) return null;
+
+  const now = Date.now();
+  const cutoff7d  = now - 7  * 86400000;
+  const cutoff30d = now - 30 * 86400000;
+
+  let wins = 0, losses = 0;
+  let wins7d = 0, total7d = 0;
+  let wins30d = 0, total30d = 0;
+  let totalEntryPrice = 0;
+  let totalPnl = 0;
+  const lastTradeTsAll = getLastTradeTs(allTrades);
+
+  for (const t of qualifyingTrades) {
+    const cashPnl = parseFloat(t.cashPnl ?? t.cash_pnl ?? t.pnl ?? t.realized_pnl ?? 'NaN');
+    const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 0);
+
+    let ts = t.timestamp ?? t.createdAt ?? t.created_at ?? t.time ?? 0;
+    if (typeof ts === 'string') ts = new Date(ts).getTime() || 0;
+    if (typeof ts === 'number' && ts < 1e12) ts *= 1000;
+
+    if (!isNaN(price)) totalEntryPrice += price;
+
+    if (!isNaN(cashPnl)) {
+      totalPnl += cashPnl;
+      if (cashPnl > 0) wins++;
+      else if (cashPnl < 0) losses++;
+
+      if (ts >= cutoff7d) {
+        total7d++;
+        if (cashPnl > 0) wins7d++;
+      }
+      if (ts >= cutoff30d) {
+        total30d++;
+        if (cashPnl > 0) wins30d++;
+      }
+    }
   }
 
-  const avgEntryPrice = qualifying.length ? totalEntryPrice / qualifying.length : 0;
-  const topCategories = Object.entries(categories)
-    .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c]) => c).join(', ') || 'Unknown';
-  const lastActiveDate = m360.lastActiveTs
-    ? new Date(m360.lastActiveTs).toISOString().split('T')[0]
-    : null;
+  const totalResolved = wins + losses;
+  const winRate     = totalResolved > 0 ? wins / totalResolved : NaN;
+  const winRate7d   = total7d  > 0 ? wins7d  / total7d  : NaN;
+  const winRate30d  = total30d > 0 ? wins30d / total30d : NaN;
+  const avgEntryPrice = qualifyingTrades.length > 0 ? totalEntryPrice / qualifyingTrades.length : 0;
 
   return {
-    address,
-    totalQualifying: qualifying.length || m360.tradeCount,
-    wins,
-    losses,
-    winRate: isNaN(m360.winRate) ? 0 : m360.winRate,
+    qualifyingCount: qualifyingTrades.length,
+    resolvedCount: totalResolved,
+    wins, losses,
+    winRate, winRate7d, winRate30d,
+    totalPnl,
     avgEntryPrice,
-    overallPnl: isNaN(m360.pnl) ? 0 : m360.pnl,
-    topCategories,
-    lastActiveDate,
-    tiers,
-    // Wallet 360 enrichment fields (surfaced in dashboard)
-    w360TradeCount: m360.tradeCount,
-    w360WinRate: m360.winRate,
-    w360Pnl: m360.pnl,
+    lastTradeTs: lastTradeTsAll,
+    lastTradeDate: lastTradeTsAll ? new Date(lastTradeTsAll).toISOString().split('T')[0] : null,
+    total7d, total30d,
   };
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-async function runScan() {
-  log('=== Polymarket Wallet Scanner starting ===');
+// ── STEP 4: Tier assignment ────────────────────────────────────────────────────
+function assignTiers(m) {
+  const tiers = [];
+  if (!m || isNaN(m.winRate) || m.totalPnl <= 0) return tiers;
+  if (m.qualifyingCount >= 30 && m.winRate >= 0.60) tiers.push(1);
+  if (m.qualifyingCount >= 20 && m.winRate >= 0.55) tiers.push(2);
+  if (m.qualifyingCount >= 15 && m.winRate >= 0.50) tiers.push(3);
+  return tiers;
+}
 
-  // Discovery: Falcon candidates (584+579) + market structure in parallel
-  const [falconWallets, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
-    fetchFalconCandidates(),
-    fetchShortResolutionMarketIds(14),
+// ── STEP 5: Scoring ────────────────────────────────────────────────────────────
+// Weighted win rate: 7d (50%) > 30d (30%) > all-time (20%)
+// + small bonus for lower avg entry price (lower price = more upside on wins)
+function computeScore(m) {
+  const wr7d  = isNaN(m.winRate7d)  ? (isNaN(m.winRate30d) ? m.winRate : m.winRate30d) : m.winRate7d;
+  const wr30d = isNaN(m.winRate30d) ? m.winRate : m.winRate30d;
+  const wrAll = isNaN(m.winRate)    ? 0 : m.winRate;
+
+  const wrScore = (wr7d * 0.5) + (wr30d * 0.3) + (wrAll * 0.2);
+
+  // Bonus: lower avg entry price → higher bonus (max +0.10 at price ≈ $0.01)
+  const priceBonus = m.avgEntryPrice > 0
+    ? Math.max(0, (0.50 - m.avgEntryPrice) / 0.50) * 0.10
+    : 0;
+
+  return wrScore + priceBonus;
+}
+
+// ── Main scan ──────────────────────────────────────────────────────────────────
+async function runScan() {
+  log('=== Polymarket Wallet Scanner v2 (direct data-api, no Falcon) starting ===');
+
+  // Phase 1: Discover candidate wallets + market structure in parallel
+  const [leaderboardWallets, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
+    fetchLeaderboardCandidates(),
+    fetchShortResolutionMarkets(14),
   ]);
 
-  // Supplement with holders from top-volume markets
+  // Supplement with holders from top-volume short-resolution markets
   const holderWallets = await fetchMarketHolders(topMarkets);
 
-  const walletSet = new Set([...falconWallets, ...holderWallets]);
+  const walletSet = new Set([...leaderboardWallets, ...holderWallets]);
   const allWallets = [...walletSet];
-  log(`Total candidates: ${allWallets.length} (${falconWallets.length} falcon + ${holderWallets.size} holders)`);
+  log(`Total candidates: ${allWallets.length} (${leaderboardWallets.length} leaderboard + ${holderWallets.size} holders)`);
 
   const tier1 = [], tier2 = [], tier3 = [];
   const seen = new Map();
   let processed = 0;
-  let skippedMetrics = 0;
-  let skippedTrades = 0;
+  let skippedBot = 0, skippedActivity = 0, skippedNoTrades = 0, skippedNoTier = 0;
+
+  const now = Date.now();
+  const cutoff7d  = now - 7  * 86400000;
+  const cutoff30d = now - 30 * 86400000;
 
   for (const address of allWallets) {
     processed++;
-    if (processed % 100 === 0) {
-      log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} (skip-metrics=${skippedMetrics} skip-trades=${skippedTrades})`);
+    if (processed % 50 === 0) {
+      log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} | bot=${skippedBot} inactive=${skippedActivity} notrades=${skippedNoTrades} notier=${skippedNoTier}`);
     }
 
     try {
-      // ── Step 2: Wallet 360 (agent 581) — metrics + tier pre-filter ──────────
-      const events581 = await callFalconSSE(581, { wallet_address: address }, null, 45000);
-      const raw581 = sseExtract(events581);
-      if (!raw581) { skippedMetrics++; continue; }
+      // Fetch raw trade history
+      const allTrades = await fetchWalletTrades(address, 1000);
 
-      const m360 = parseWallet360(raw581);
-      if (!m360) { skippedMetrics++; continue; }
+      if (!allTrades.length) { skippedNoTrades++; continue; }
 
-      const tiers = assignTiers(m360.winRate, m360.tradeCount, m360.pnl, m360.lastActiveTs);
-      if (!tiers.length) { skippedMetrics++; continue; }
+      // STEP 1 — Bot filter
+      if (isBotWallet(allTrades)) { skippedBot++; continue; }
 
-      // ── Step 3: Trade verification (agent 556) — price < $0.50 + sub-14d ───
-      const events556 = await callFalconSSE(556, { wallet_address: address }, null, 45000);
-      const raw556 = sseExtract(events556);
-      const trades = parseFalconTrades(raw556);
+      // STEP 2 — Activity filter (last 7d + last 30d)
+      const lastTs = getLastTradeTs(allTrades);
+      if (lastTs < cutoff7d)  { skippedActivity++; continue; }  // must have traded in last 7 days
+      if (lastTs < cutoff30d) { skippedActivity++; continue; }  // belt-and-suspenders
 
-      const qualifying = trades.filter(t => {
-        const side = (t.side ?? t.trade_side ?? t.type ?? '').toUpperCase();
-        const price = parseFloat(t.price ?? t.avg_price ?? t.avgPrice ?? 1);
-        const cid = (t.conditionId ?? t.condition_id ?? t.market ?? t.market_id ?? '').toLowerCase();
-        return side === 'BUY' && !isNaN(price) && price < 0.50 &&
-          (shortConditionIds.size === 0 || shortConditionIds.has(cid));
-      });
+      // STEP 3 — Filter to qualifying trades
+      const qualifying = filterQualifyingTrades(allTrades, shortConditionIds);
+      if (!qualifying.length) { skippedNoTrades++; continue; }
 
-      if (!qualifying.length) { skippedTrades++; continue; }
+      // STEP 4 — Compute metrics on qualifying trades
+      const m = calcMetrics(qualifying, allTrades);
+      if (!m) { skippedNoTrades++; continue; }
 
-      const record = buildRecord(address, m360, trades, shortConditionIds, tiers);
+      const tiers = assignTiers(m);
+      if (!tiers.length) { skippedNoTier++; continue; }
+
+      // STEP 5 — Score
+      const score = computeScore(m);
+
+      const record = {
+        address,
+        totalQualifying: m.qualifyingCount,
+        wins: m.wins,
+        losses: m.losses,
+        winRate: m.winRate,
+        winRate7d: m.winRate7d,
+        winRate30d: m.winRate30d,
+        avgEntryPrice: m.avgEntryPrice,
+        overallPnl: m.totalPnl,
+        lastTradeDate: m.lastTradeDate,
+        tiers,
+        score,
+        // Extra detail for dashboard
+        total7dTrades: m.total7d,
+        total30dTrades: m.total30d,
+      };
+
       seen.set(address, record);
       if (tiers.includes(1)) tier1.push(record);
       if (tiers.includes(2)) tier2.push(record);
@@ -568,11 +487,13 @@ async function runScan() {
       logError(`Evaluate ${address}`, e);
     }
 
-    await sleep(300);
+    await sleep(250);
   }
 
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
-  const sortFn = (a, b) => b.winRate - a.winRate || b.totalQualifying - a.totalQualifying;
+
+  // Sort each tier by score descending
+  const sortFn = (a, b) => b.score - a.score;
   [tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
 
   const results = {
@@ -580,9 +501,11 @@ async function runScan() {
     tier1, tier2, tier3, multiTier,
     stats: {
       walletsScanned: allWallets.length,
-      walletsEvaluated: processed,
-      skippedMetrics,
-      skippedTrades,
+      walletsProcessed: processed,
+      skippedBot,
+      skippedActivity,
+      skippedNoTrades,
+      skippedNoTier,
       tier1Count: tier1.length,
       tier2Count: tier2.length,
       tier3Count: tier3.length,
@@ -595,6 +518,7 @@ async function runScan() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(results, null, 2));
 
   log(`=== Scan complete: T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length} ===`);
+  log(`    Skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noTier=${skippedNoTier}`);
   return results;
 }
 
