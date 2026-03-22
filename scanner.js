@@ -138,10 +138,12 @@ async function fetchLeaderboard() {
 }
 
 // ── 2. Short-resolution markets ───────────────────────────────────────────────
-// Returns a Set of conditionIds for markets resolving within maxDays
+// Returns { conditionIds: Set, topMarkets: [{conditionId, volume}] }
+// topMarkets is the top N by volume, used to seed wallet discovery.
 async function fetchShortResolutionMarketIds(maxDays = 14) {
   log(`Fetching markets resolving within ${maxDays} days...`);
   const conditionIds = new Set();
+  const allShortMarkets = []; // [{conditionId, volume}] for holder discovery
   const pageSize = 500;
   let offset = 0;
   const deadlineCutoff = Date.now() + maxDays * 86400000;
@@ -160,7 +162,12 @@ async function fetchShortResolutionMarketIds(maxDays = 14) {
         const endTs = new Date(endDate).getTime();
         if (endTs > Date.now() && endTs <= deadlineCutoff) {
           const cid = m.conditionId || m.condition_id;
-          if (cid) { conditionIds.add(cid.toLowerCase()); added++; }
+          if (cid) {
+            conditionIds.add(cid.toLowerCase());
+            const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
+            allShortMarkets.push({ conditionId: cid.toLowerCase(), volume: vol });
+            added++;
+          }
         }
       }
       log(`  Markets offset=${offset}: ${rows.length} rows, ${added} short-res, total=${conditionIds.size}`);
@@ -172,8 +179,42 @@ async function fetchShortResolutionMarketIds(maxDays = 14) {
       break;
     }
   }
-  log(`Found ${conditionIds.size} short-resolution market conditionIds`);
-  return conditionIds;
+
+  // Sort by volume descending, keep top 300 for holder discovery
+  allShortMarkets.sort((a, b) => b.volume - a.volume);
+  const topMarkets = allShortMarkets.slice(0, 300);
+
+  log(`Found ${conditionIds.size} short-resolution market conditionIds (top ${topMarkets.length} by volume for holder scan)`);
+  return { conditionIds, topMarkets };
+}
+
+// ── 3. Holders from top markets ───────────────────────────────────────────────
+// Fetches top position holders for each of the top markets, returns wallet set
+async function fetchMarketHolders(topMarkets) {
+  log(`Fetching holders from top ${topMarkets.length} markets...`);
+  const wallets = new Set();
+
+  for (let i = 0; i < topMarkets.length; i++) {
+    const { conditionId } = topMarkets[i];
+    try {
+      const url = `${DATA_API}/positions?market=${conditionId}&limit=50&sortBy=size&sortDirection=DESC`;
+      const data = await fetchJSON(url, 2, 1000);
+      const rows = Array.isArray(data) ? data : (data.data || data.positions || []);
+      for (const row of rows) {
+        const addr = row.proxyWallet || row.proxy_wallet || row.user || row.address;
+        if (addr) wallets.add(addr.toLowerCase());
+      }
+    } catch (e) {
+      // Silently skip — not every market will have a positions endpoint
+    }
+    if ((i + 1) % 50 === 0) {
+      log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets so far`);
+    }
+    await sleep(150);
+  }
+
+  log(`Market holder scan complete: ${wallets.size} unique wallets`);
+  return wallets;
 }
 
 // ── 3. Wallet trade history ───────────────────────────────────────────────────
@@ -285,13 +326,18 @@ async function runScan() {
   log('=== Polymarket Wallet Scanner starting ===');
 
   // Run leaderboard + market fetches in parallel
-  const [leaderboardWallets, shortConditionIds] = await Promise.all([
-    fetchLeaderboard(1000),
+  const [leaderboardWallets, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
+    fetchLeaderboard(),
     fetchShortResolutionMarketIds(14),
   ]);
 
-  const allWallets = leaderboardWallets; // leaderboard is the primary source
-  log(`Total wallets to evaluate: ${allWallets.length}`);
+  // Expand wallet pool with holders from top markets by volume
+  const holderWallets = await fetchMarketHolders(topMarkets);
+
+  // Union all sources, deduplicated
+  const walletSet = new Set([...leaderboardWallets, ...holderWallets]);
+  const allWallets = [...walletSet];
+  log(`Total wallets to evaluate: ${allWallets.length} (${leaderboardWallets.length} leaderboard + ${holderWallets.size} from markets, deduplicated)`);
 
   const tier1 = [], tier2 = [], tier3 = [];
   const seen = new Map();
