@@ -194,18 +194,20 @@ async function fetchMarketHolders(topMarkets) {
   log(`Fetching holders from top ${topMarkets.length} markets...`);
   const wallets = new Set();
 
+  let firstErr = true;
   for (let i = 0; i < topMarkets.length; i++) {
     const { conditionId } = topMarkets[i];
     try {
-      const url = `${DATA_API}/positions?market=${conditionId}&limit=50&sortBy=size&sortDirection=DESC`;
+      const url = `${DATA_API}/positions?market=${conditionId}&limit=50`;
       const data = await fetchJSON(url, 2, 1000);
       const rows = Array.isArray(data) ? data : (data.data || data.positions || []);
+      if (i === 0) log(`  [DEBUG] positions[0] keys: ${rows.length ? Object.keys(rows[0]).join(',') : 'empty'}`);
       for (const row of rows) {
         const addr = row.proxyWallet || row.proxy_wallet || row.user || row.address;
         if (addr) wallets.add(addr.toLowerCase());
       }
     } catch (e) {
-      // Silently skip — not every market will have a positions endpoint
+      if (firstErr) { logError(`Positions fetch (market ${conditionId})`, e); firstErr = false; }
     }
     if ((i + 1) % 50 === 0) {
       log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets so far`);
