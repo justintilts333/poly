@@ -150,6 +150,52 @@ async function fetchFalconStats(address) {
   }, FALCON_TOKEN);
 }
 
+// Bulk leaderboard via Falcon parameterized semantic endpoint (agent_id 579)
+async function fetchFalconLeaderboard() {
+  log('Fetching Falcon leaderboard...');
+  const wallets = new Set();
+  const periods = ['1d', '7d', '30d'];
+  const pageSize = 100;
+
+  for (const period of periods) {
+    let offset = 0;
+    while (true) {
+      try {
+        const data = await postJSON(
+          'https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized',
+          {
+            agent_id: 579,
+            params: { wallet_address: 'ALL', leaderboard_period: period },
+            pagination: { limit: pageSize, offset },
+            formatter_config: { format_type: 'raw' },
+          },
+          FALCON_TOKEN
+        );
+        const rows = Array.isArray(data) ? data : (data.data || data.results || data.traders || []);
+        if (offset === 0 && period === '1d') {
+          log(`  [DEBUG] Falcon leaderboard sample: ${JSON.stringify(data).slice(0, 300)}`);
+        }
+        if (!rows.length) break;
+        for (const row of rows) {
+          const addr = row.proxyWallet || row.proxy_wallet || row.wallet || row.wallet_address || row.address;
+          if (addr) wallets.add(addr.toLowerCase());
+        }
+        if (rows.length < pageSize) break;
+        offset += pageSize;
+        await sleep(300);
+      } catch (e) {
+        logError(`Falcon leaderboard period=${period} offset=${offset}`, e);
+        break;
+      }
+    }
+    log(`  Falcon leaderboard ${period}: ${wallets.size} wallets so far`);
+    await sleep(500);
+  }
+
+  log(`Falcon leaderboard complete: ${wallets.size} wallets`);
+  return [...wallets];
+}
+
 const DATA_API        = 'https://data-api.polymarket.com';
 const DATA_API_V1     = 'https://data-api.polymarket.com/v1';
 const GAMMA_API       = 'https://gamma-api.polymarket.com';
@@ -373,19 +419,20 @@ function assignTiers(w) {
 async function runScan() {
   log('=== Polymarket Wallet Scanner starting ===');
 
-  // Run leaderboard + market fetches in parallel
-  const [leaderboardWallets, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
+  // Run all discovery sources in parallel
+  const [leaderboardWallets, { conditionIds: shortConditionIds, topMarkets }, falconLeaderboardWallets] = await Promise.all([
     fetchLeaderboard(),
     fetchShortResolutionMarketIds(14),
+    fetchFalconLeaderboard(),
   ]);
 
   // Expand wallet pool with holders from top markets by volume
   const holderWallets = await fetchMarketHolders(topMarkets);
 
   // Union all sources, deduplicated
-  const walletSet = new Set([...leaderboardWallets, ...holderWallets]);
+  const walletSet = new Set([...leaderboardWallets, ...falconLeaderboardWallets, ...holderWallets]);
   const allWallets = [...walletSet];
-  log(`Total wallets to evaluate: ${allWallets.length} (${leaderboardWallets.length} leaderboard + ${holderWallets.size} from markets, deduplicated)`);
+  log(`Total wallets to evaluate: ${allWallets.length} (${leaderboardWallets.length} polymarket-lb + ${falconLeaderboardWallets.length} falcon-lb + ${holderWallets.size} holders, deduplicated)`);
 
   const tier1 = [], tier2 = [], tier3 = [];
   const seen = new Map();
