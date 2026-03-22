@@ -41,31 +41,7 @@ jobs:
               -o ServerAliveInterval=1 \
               -o ServerAliveCountMax=120 \
               ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
-              'APP_DIR=/opt/polymarket-scanner
-               LOG=/var/log/polymarket-scanner.log
-
-               echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy triggered" >> "$LOG"
-
-               cd "$APP_DIR"
-
-               # Kill any running scanner and start a fresh one (fully detached)
-               pkill -KILL -f "node.*scanner.js" 2>/dev/null || true
-               rm -f /tmp/polymarket-scanner.lock
-               nohup node "$APP_DIR/scanner.js" </dev/null >> "$LOG" 2>&1 &
-               SCANNER_PID=$!
-               disown $SCANNER_PID
-               echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Scanner launched (PID $SCANNER_PID)" >> "$LOG"
-
-               # Restart web server
-               if pm2 list 2>/dev/null | grep -q polymarket-scanner; then
-                 pm2 restart polymarket-scanner || pm2 start server.js --name polymarket-scanner --restart-delay=3000 --max-restarts=10
-               else
-                 pm2 start server.js --name polymarket-scanner --restart-delay=3000 --max-restarts=10
-               fi
-               pm2 save || true
-
-               echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy complete" >> "$LOG"
-               exit 0'
+              'pkill -KILL -f "node.*scanner.js" 2>/dev/null; rm -f /tmp/polymarket-scanner.lock; nohup node /opt/polymarket-scanner/scanner.js </dev/null >> /var/log/polymarket-scanner.log 2>&1 & echo "scanner_pid=$!"'
 
       - name: Verify dashboard is up
         run: |
