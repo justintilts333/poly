@@ -155,7 +155,6 @@ async function fetchShortResolutionMarketIds(maxDays = 14) {
       const rows = Array.isArray(data) ? data : (data.data || data.markets || []);
       if (!rows.length) break;
 
-      if (offset === 0 && rows.length) log(`  [DEBUG] gamma market keys: ${Object.keys(rows[0]).join(',')}`);
       let added = 0;
       for (const m of rows) {
         const endDate = m.endDate || m.end_date || m.resolutionDate;
@@ -166,9 +165,7 @@ async function fetchShortResolutionMarketIds(maxDays = 14) {
           if (cid) {
             conditionIds.add(cid.toLowerCase());
             const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
-            // clobTokenIds: array of outcome token IDs used by data-api positions endpoint
-            const tokenIds = m.clobTokenIds || m.clob_token_ids || m.tokenIds || [];
-            allShortMarkets.push({ conditionId: cid.toLowerCase(), volume: vol, tokenIds });
+            allShortMarkets.push({ conditionId: cid.toLowerCase(), volume: vol });
             added++;
           }
         }
@@ -197,22 +194,19 @@ async function fetchMarketHolders(topMarkets) {
   log(`Fetching holders from top ${topMarkets.length} markets...`);
   const wallets = new Set();
 
-  let firstErr = true;
   for (let i = 0; i < topMarkets.length; i++) {
-    const { conditionId, tokenIds } = topMarkets[i];
-    // Use first CLOB token ID if available; fall back to conditionId
-    const assetId = (Array.isArray(tokenIds) && tokenIds[0]) ? tokenIds[0] : conditionId;
+    const { conditionId } = topMarkets[i];
     try {
-      const url = `${DATA_API}/positions?asset_id=${assetId}&limit=50`;
+      // /holders returns all position holders for a market; /positions requires a user address
+      const url = `${DATA_API}/holders?market=${conditionId}&limit=100`;
       const data = await fetchJSON(url, 2, 1000);
-      const rows = Array.isArray(data) ? data : (data.data || data.positions || []);
-      if (i === 0) log(`  [DEBUG] positions url=${url} rows=${rows.length} keys=${rows.length ? Object.keys(rows[0]).join(',') : 'empty'}`);
+      const rows = Array.isArray(data) ? data : (data.data || data.holders || []);
       for (const row of rows) {
-        const addr = row.proxyWallet || row.proxy_wallet || row.user || row.address;
+        const addr = row.proxyWallet || row.proxy_wallet || row.user || row.address || row.holder;
         if (addr) wallets.add(addr.toLowerCase());
       }
     } catch (e) {
-      if (firstErr) { logError(`Positions fetch (asset ${assetId})`, e); firstErr = false; }
+      // skip markets with no holders data
     }
     if ((i + 1) % 50 === 0) {
       log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets so far`);
