@@ -200,13 +200,12 @@ async function fetchMarketHolders(topMarkets) {
       // /holders returns all position holders for a market; /positions requires a user address
       const url = `${DATA_API}/holders?market=${conditionId}&limit=100`;
       const data = await fetchJSON(url, 2, 1000);
-      const rows = Array.isArray(data) ? data : (data.data || data.holders || []);
-      if (i === 0) {
-        log(`  [DEBUG] holders url=${url} type=${typeof data} isArr=${Array.isArray(data)} rows=${rows.length} sample=${JSON.stringify(data).slice(0, 300)}`);
-      }
-      for (const row of rows) {
-        const addr = row.proxyWallet || row.proxy_wallet || row.user || row.address || row.holder;
-        if (addr) wallets.add(addr.toLowerCase());
+      // Response: [{token, holders: [{proxyWallet, ...}]}, ...]
+      const groups = Array.isArray(data) ? data : [];
+      for (const group of groups) {
+        for (const h of (group.holders || [])) {
+          if (h.proxyWallet) wallets.add(h.proxyWallet.toLowerCase());
+        }
       }
     } catch (e) {
       if (i === 0) logError(`Holders fetch (market ${conditionId})`, e);
