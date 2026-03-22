@@ -107,8 +107,7 @@ const DATA_API        = 'https://data-api.polymarket.com';
 const GAMMA_API       = 'https://gamma-api.polymarket.com';
 const LEADERBOARD_API = 'https://leaderboard-api.polymarket.com';
 
-// ── STEP 0: Wallet discovery via leaderboard ──────────────────────────────────
-// Fetches multiple windows (all, 1m, 1w) to gather a broad candidate set.
+// ── Wallet discovery: leaderboard ─────────────────────────────────────────────
 async function fetchLeaderboardCandidates() {
   log('Fetching leaderboard candidates...');
   const wallets = new Set();
@@ -118,7 +117,7 @@ async function fetchLeaderboardCandidates() {
   for (const window of windows) {
     let offset = 0;
     let pages = 0;
-    while (pages < 20) { // cap at 2000 per window
+    while (pages < 20) {
       try {
         const url = `${LEADERBOARD_API}/l/rankings?window=${window}&limit=${limit}&offset=${offset}`;
         const data = await fetchJSON(url, 3, 2000);
@@ -128,7 +127,6 @@ async function fetchLeaderboardCandidates() {
         if (offset === 0) {
           log(`  [DEBUG] leaderboard window=${window} keys: ${Object.keys(rows[0] || {}).join(',')}`);
         }
-
         for (const row of rows) {
           const addr = row.proxyWallet ?? row.proxy_wallet ?? row.wallet ?? row.address ?? row.user;
           if (addr && typeof addr === 'string') wallets.add(addr.toLowerCase());
@@ -150,7 +148,7 @@ async function fetchLeaderboardCandidates() {
   return [...wallets];
 }
 
-// ── STEP 0b: Short-resolution markets ─────────────────────────────────────────
+// ── Short-resolution markets ───────────────────────────────────────────────────
 async function fetchShortResolutionMarkets(maxDays = 14) {
   log(`Fetching markets resolving within ${maxDays} days...`);
   const conditionIds = new Set();
@@ -197,7 +195,7 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
   return { conditionIds, topMarkets };
 }
 
-// ── STEP 0c: Market holders ────────────────────────────────────────────────────
+// ── Market holders ─────────────────────────────────────────────────────────────
 async function fetchMarketHolders(topMarkets) {
   log(`Fetching holders from top ${topMarkets.length} markets...`);
   const wallets = new Set();
@@ -226,8 +224,7 @@ async function fetchMarketHolders(topMarkets) {
   return wallets;
 }
 
-// ── Trade history via data-api ─────────────────────────────────────────────────
-// Fetches all trade activity for a wallet. Returns raw trade rows.
+// ── Wallet trade history ───────────────────────────────────────────────────────
 let activityFieldsLogged = false;
 
 async function fetchWalletTrades(address, maxTrades = 1000) {
@@ -245,14 +242,14 @@ async function fetchWalletTrades(address, maxTrades = 1000) {
       if (!activityFieldsLogged && rows.length > 0) {
         activityFieldsLogged = true;
         log(`  [DEBUG] activity field names: ${Object.keys(rows[0]).join(', ')}`);
+        log(`  [DEBUG] activity type values sample: ${rows.slice(0,5).map(r=>r.type).join(',')}`);
       }
 
       trades.push(...rows);
       if (rows.length < limit) break;
       offset += limit;
       await sleep(200);
-    } catch (e) {
-      // Non-fatal: return whatever we have
+    } catch (_) {
       break;
     }
   }
@@ -261,62 +258,112 @@ async function fetchWalletTrades(address, maxTrades = 1000) {
 }
 
 // ── STEP 1: Bot filter ─────────────────────────────────────────────────────────
-// Discard wallets that look like bots.
-// Criteria (applied to raw all-trades list before any other filtering):
-//   a) Total raw trades > 2000 (thousands of micro-trades)
-//   b) All trade sizes suspiciously uniform (stdev < 1% of mean on usdcSize)
 function isBotWallet(allTrades) {
   if (allTrades.length > 2000) return true;
 
-  // Check trade size uniformity on available trades
   const sizes = allTrades
-    .map(t => parseFloat(t.usdcSize ?? t.amount ?? t.size ?? 0))
+    .map(t => parseFloat(t.usdcSize ?? t.amount ?? 0))
     .filter(s => s > 0);
 
   if (sizes.length >= 10) {
     const mean = sizes.reduce((a, b) => a + b, 0) / sizes.length;
-    const variance = sizes.reduce((a, v) => a + Math.pow(v - mean, 2), 0) / sizes.length;
-    const stdev = Math.sqrt(variance);
-    if (mean > 0 && stdev / mean < 0.01) return true; // <1% coefficient of variation
+    if (mean > 0) {
+      const variance = sizes.reduce((a, v) => a + Math.pow(v - mean, 2), 0) / sizes.length;
+      const stdev = Math.sqrt(variance);
+      if (stdev / mean < 0.01) return true;
+    }
   }
 
   return false;
 }
 
-// ── STEP 2: Activity filter ────────────────────────────────────────────────────
-// Returns the most recent trade timestamp in ms, or 0 if no trades.
+// ── STEP 2: Last trade timestamp ───────────────────────────────────────────────
 function getLastTradeTs(allTrades) {
   let latest = 0;
   for (const t of allTrades) {
-    let ts = t.timestamp ?? t.createdAt ?? t.created_at ?? t.time ?? 0;
+    let ts = t.timestamp ?? t.createdAt ?? t.created_at ?? 0;
     if (typeof ts === 'string') ts = new Date(ts).getTime() || 0;
-    if (typeof ts === 'number' && ts < 1e12) ts *= 1000; // seconds → ms
+    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
     if (ts > latest) latest = ts;
   }
   return latest;
 }
 
-// ── STEP 3: Trade-level filter ─────────────────────────────────────────────────
-// Keep only: BUY side, price < $0.50, conditionId in short-resolution set.
-function filterQualifyingTrades(allTrades, shortConditionIds) {
+// ── Win detection: build REDEEM map ───────────────────────────────────────────
+// The data-api activity endpoint does NOT include cashPnl.
+// Instead, a "REDEEM" event means the market resolved in the user's favour for
+// that conditionId + outcomeIndex pair.  We use that as our win signal.
+//
+// redeemByKey:   Map<"conditionId:outcomeIndex" -> redeemTimestamp>
+// resolvedCids:  Set<conditionId> — any conditionId that has ANY redeem
+//                (meaning the market is resolved, whichever side won)
+function buildRedeemInfo(allTrades) {
+  const redeemByKey  = new Map();
+  const resolvedCids = new Set();
+
+  for (const t of allTrades) {
+    const tType = (t.type || '').toUpperCase();
+    if (tType !== 'REDEEM' && tType !== 'REDEMPTION') continue;
+
+    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    if (!cid) continue;
+
+    const key = `${cid}:${t.outcomeIndex ?? ''}`;
+    let ts = t.timestamp ?? 0;
+    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+
+    if (!redeemByKey.has(key) || ts > redeemByKey.get(key)) {
+      redeemByKey.set(key, ts || Date.now());
+    }
+    resolvedCids.add(cid);
+  }
+
+  return { redeemByKey, resolvedCids };
+}
+
+// ── STEP 3: Qualifying trades filter ──────────────────────────────────────────
+// Keep BUY trades where:
+//   a) price < $0.50
+//   b) market is "short-resolution" — either:
+//      i.  conditionId is in our upcoming <14d set (will resolve soon), OR
+//      ii. there is a REDEEM within 14 days of the BUY (already resolved quickly)
+function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
+  const maxResolutionMs = 14 * 86400000;
+
   return allTrades.filter(t => {
-    const side = (t.side ?? t.trade_side ?? t.type ?? '').toUpperCase();
-    if (side !== 'BUY') return false;
+    // Must be a BUY
+    const tType = (t.type || '').toUpperCase();
+    const side  = (t.side  || '').toUpperCase();
+    if (side !== 'BUY' && tType !== 'BUY') return false;
+    if (tType === 'REDEEM' || tType === 'SELL' || tType === 'MERGE') return false;
+
+    // Price < $0.50
     const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
     if (isNaN(price) || price >= 0.50) return false;
-    const cid = (t.conditionId ?? t.condition_id ?? t.market ?? t.marketId ?? '').toLowerCase();
-    // If shortConditionIds is empty (markets API failed) allow all
-    if (shortConditionIds.size > 0 && !shortConditionIds.has(cid)) return false;
-    return true;
+
+    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    const key = `${cid}:${t.outcomeIndex ?? ''}`;
+
+    // Short-resolution check
+    let buyTs = t.timestamp ?? 0;
+    if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
+
+    const inUpcomingShortMarket = shortConditionIds.size > 0 && shortConditionIds.has(cid);
+
+    const redeemTs = redeemByKey.get(key);
+    const resolvedQuickly = redeemTs &&
+      (redeemTs - buyTs) >= 0 &&
+      (redeemTs - buyTs) <= maxResolutionMs;
+
+    return inUpcomingShortMarket || resolvedQuickly;
   });
 }
 
-// ── STEP 4: Metric calculation ─────────────────────────────────────────────────
-// All metrics computed on the qualifying subset.
-function calcMetrics(qualifyingTrades, allTrades) {
+// ── STEP 4: Metrics on qualifying trades ──────────────────────────────────────
+function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids) {
   if (!qualifyingTrades.length) return null;
 
-  const now = Date.now();
+  const now       = Date.now();
   const cutoff7d  = now - 7  * 86400000;
   const cutoff30d = now - 30 * 86400000;
 
@@ -325,74 +372,86 @@ function calcMetrics(qualifyingTrades, allTrades) {
   let wins30d = 0, total30d = 0;
   let totalEntryPrice = 0;
   let totalPnl = 0;
-  const lastTradeTsAll = getLastTradeTs(allTrades);
 
   for (const t of qualifyingTrades) {
-    const cashPnl = parseFloat(t.cashPnl ?? t.cash_pnl ?? t.pnl ?? t.realized_pnl ?? 'NaN');
+    const cid   = (t.conditionId || '').toLowerCase();
+    const key   = `${cid}:${t.outcomeIndex ?? ''}`;
     const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 0);
+    // usdcSize = $ invested; size = shares bought
+    const usdcSize = parseFloat(t.usdcSize ?? 0);
+    const shares   = parseFloat(t.size ?? 0);
 
-    let ts = t.timestamp ?? t.createdAt ?? t.created_at ?? t.time ?? 0;
-    if (typeof ts === 'string') ts = new Date(ts).getTime() || 0;
-    if (typeof ts === 'number' && ts < 1e12) ts *= 1000;
+    let ts = t.timestamp ?? 0;
+    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
 
     if (!isNaN(price)) totalEntryPrice += price;
 
-    if (!isNaN(cashPnl)) {
-      totalPnl += cashPnl;
-      if (cashPnl > 0) wins++;
-      else if (cashPnl < 0) losses++;
+    const redeemTs  = redeemByKey.get(key);
+    const isWin     = !!redeemTs;
+    // Only count as LOSS if the market is confirmed resolved (another outcome redeemed)
+    const isLoss    = !redeemTs && resolvedCids.has(cid);
 
-      if (ts >= cutoff7d) {
-        total7d++;
-        if (cashPnl > 0) wins7d++;
-      }
-      if (ts >= cutoff30d) {
-        total30d++;
-        if (cashPnl > 0) wins30d++;
-      }
+    if (!isWin && !isLoss) continue; // market not yet resolved — skip for win rate
+
+    // PnL:  WIN  → payout = shares × $1, net = shares - usdcSize
+    //       LOSS → net = -usdcSize
+    if (isWin) {
+      wins++;
+      totalPnl += shares > 0 ? shares - usdcSize : usdcSize * (1 / Math.max(price, 0.001) - 1);
+    } else {
+      losses++;
+      totalPnl -= usdcSize > 0 ? usdcSize : price;
+    }
+
+    const counted = true; // resolved trade
+    if (counted) {
+      if (ts >= cutoff7d)  { total7d++;  if (isWin) wins7d++;  }
+      if (ts >= cutoff30d) { total30d++; if (isWin) wins30d++; }
     }
   }
 
   const totalResolved = wins + losses;
-  const winRate     = totalResolved > 0 ? wins / totalResolved : NaN;
-  const winRate7d   = total7d  > 0 ? wins7d  / total7d  : NaN;
-  const winRate30d  = total30d > 0 ? wins30d / total30d : NaN;
+  if (totalResolved === 0) return null; // no resolved trades to compute from
+
+  const winRate    = wins / totalResolved;
+  const winRate7d  = total7d  > 0 ? wins7d  / total7d  : NaN;
+  const winRate30d = total30d > 0 ? wins30d / total30d : NaN;
   const avgEntryPrice = qualifyingTrades.length > 0 ? totalEntryPrice / qualifyingTrades.length : 0;
+  const lastTradeTs   = getLastTradeTs(allTrades);
 
   return {
     qualifyingCount: qualifyingTrades.length,
-    resolvedCount: totalResolved,
+    resolvedCount:   totalResolved,
     wins, losses,
     winRate, winRate7d, winRate30d,
     totalPnl,
     avgEntryPrice,
-    lastTradeTs: lastTradeTsAll,
-    lastTradeDate: lastTradeTsAll ? new Date(lastTradeTsAll).toISOString().split('T')[0] : null,
+    lastTradeTs,
+    lastTradeDate: lastTradeTs ? new Date(lastTradeTs).toISOString().split('T')[0] : null,
     total7d, total30d,
   };
 }
 
-// ── STEP 4: Tier assignment ────────────────────────────────────────────────────
+// ── Tier assignment ────────────────────────────────────────────────────────────
 function assignTiers(m) {
   const tiers = [];
-  if (!m || isNaN(m.winRate) || m.totalPnl <= 0) return tiers;
-  if (m.qualifyingCount >= 30 && m.winRate >= 0.60) tiers.push(1);
-  if (m.qualifyingCount >= 20 && m.winRate >= 0.55) tiers.push(2);
-  if (m.qualifyingCount >= 15 && m.winRate >= 0.50) tiers.push(3);
+  if (!m || m.totalPnl <= 0) return tiers;
+  // Use resolvedCount (not qualifyingCount) for tier thresholds
+  const n = m.resolvedCount;
+  if (n >= 30 && m.winRate >= 0.60) tiers.push(1);
+  if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
+  if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
   return tiers;
 }
 
-// ── STEP 5: Scoring ────────────────────────────────────────────────────────────
-// Weighted win rate: 7d (50%) > 30d (30%) > all-time (20%)
-// + small bonus for lower avg entry price (lower price = more upside on wins)
+// ── Score ──────────────────────────────────────────────────────────────────────
 function computeScore(m) {
   const wr7d  = isNaN(m.winRate7d)  ? (isNaN(m.winRate30d) ? m.winRate : m.winRate30d) : m.winRate7d;
   const wr30d = isNaN(m.winRate30d) ? m.winRate : m.winRate30d;
-  const wrAll = isNaN(m.winRate)    ? 0 : m.winRate;
+  const wrAll = m.winRate;
 
   const wrScore = (wr7d * 0.5) + (wr30d * 0.3) + (wrAll * 0.2);
-
-  // Bonus: lower avg entry price → higher bonus (max +0.10 at price ≈ $0.01)
+  // Bonus: lower avg entry price → higher potential return → small bonus
   const priceBonus = m.avgEntryPrice > 0
     ? Math.max(0, (0.50 - m.avgEntryPrice) / 0.50) * 0.10
     : 0;
@@ -400,17 +459,15 @@ function computeScore(m) {
   return wrScore + priceBonus;
 }
 
-// ── Main scan ──────────────────────────────────────────────────────────────────
+// ── Main ───────────────────────────────────────────────────────────────────────
 async function runScan() {
-  log('=== Polymarket Wallet Scanner v2 (direct data-api, no Falcon) starting ===');
+  log('=== Polymarket Wallet Scanner v2 (REDEEM-based win detection) ===');
 
-  // Phase 1: Discover candidate wallets + market structure in parallel
   const [leaderboardWallets, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
     fetchLeaderboardCandidates(),
     fetchShortResolutionMarkets(14),
   ]);
 
-  // Supplement with holders from top-volume short-resolution markets
   const holderWallets = await fetchMarketHolders(topMarkets);
 
   const walletSet = new Set([...leaderboardWallets, ...holderWallets]);
@@ -418,63 +475,64 @@ async function runScan() {
   log(`Total candidates: ${allWallets.length} (${leaderboardWallets.length} leaderboard + ${holderWallets.size} holders)`);
 
   const tier1 = [], tier2 = [], tier3 = [];
-  const seen = new Map();
+  const seen  = new Map();
   let processed = 0;
-  let skippedBot = 0, skippedActivity = 0, skippedNoTrades = 0, skippedNoTier = 0;
+  let skippedBot = 0, skippedActivity = 0, skippedNoTrades = 0,
+      skippedNoQualifying = 0, skippedNoResolved = 0, skippedNoTier = 0;
 
-  const now = Date.now();
+  const now       = Date.now();
   const cutoff7d  = now - 7  * 86400000;
   const cutoff30d = now - 30 * 86400000;
 
   for (const address of allWallets) {
     processed++;
     if (processed % 50 === 0) {
-      log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} | bot=${skippedBot} inactive=${skippedActivity} notrades=${skippedNoTrades} notier=${skippedNoTier}`);
+      log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} | bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
     }
 
     try {
-      // Fetch raw trade history
       const allTrades = await fetchWalletTrades(address, 1000);
-
       if (!allTrades.length) { skippedNoTrades++; continue; }
 
-      // STEP 1 — Bot filter
+      // STEP 1: bot filter
       if (isBotWallet(allTrades)) { skippedBot++; continue; }
 
-      // STEP 2 — Activity filter (last 7d + last 30d)
+      // STEP 2: activity filter — last trade within 7 days
       const lastTs = getLastTradeTs(allTrades);
-      if (lastTs < cutoff7d)  { skippedActivity++; continue; }  // must have traded in last 7 days
-      if (lastTs < cutoff30d) { skippedActivity++; continue; }  // belt-and-suspenders
+      if (lastTs < cutoff7d) { skippedActivity++; continue; }
 
-      // STEP 3 — Filter to qualifying trades
-      const qualifying = filterQualifyingTrades(allTrades, shortConditionIds);
-      if (!qualifying.length) { skippedNoTrades++; continue; }
+      // Build REDEEM info for this wallet's full activity
+      const { redeemByKey, resolvedCids } = buildRedeemInfo(allTrades);
 
-      // STEP 4 — Compute metrics on qualifying trades
-      const m = calcMetrics(qualifying, allTrades);
-      if (!m) { skippedNoTrades++; continue; }
+      // STEP 3: qualifying trades
+      const qualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
+      if (!qualifying.length) { skippedNoQualifying++; continue; }
+
+      // STEP 4: metrics
+      const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids);
+      if (!m) { skippedNoResolved++; continue; }
 
       const tiers = assignTiers(m);
       if (!tiers.length) { skippedNoTier++; continue; }
 
-      // STEP 5 — Score
+      // STEP 5: score
       const score = computeScore(m);
 
       const record = {
         address,
         totalQualifying: m.qualifyingCount,
-        wins: m.wins,
-        losses: m.losses,
-        winRate: m.winRate,
-        winRate7d: m.winRate7d,
+        resolvedCount:   m.resolvedCount,
+        wins:    m.wins,
+        losses:  m.losses,
+        winRate:    m.winRate,
+        winRate7d:  m.winRate7d,
         winRate30d: m.winRate30d,
         avgEntryPrice: m.avgEntryPrice,
-        overallPnl: m.totalPnl,
+        overallPnl:    m.totalPnl,
         lastTradeDate: m.lastTradeDate,
         tiers,
         score,
-        // Extra detail for dashboard
-        total7dTrades: m.total7d,
+        total7dTrades:  m.total7d,
         total30dTrades: m.total30d,
       };
 
@@ -491,8 +549,6 @@ async function runScan() {
   }
 
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
-
-  // Sort each tier by score descending
   const sortFn = (a, b) => b.score - a.score;
   [tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
 
@@ -500,15 +556,17 @@ async function runScan() {
     scanTime: new Date().toISOString(),
     tier1, tier2, tier3, multiTier,
     stats: {
-      walletsScanned: allWallets.length,
-      walletsProcessed: processed,
+      walletsScanned:    allWallets.length,
+      walletsProcessed:  processed,
       skippedBot,
       skippedActivity,
       skippedNoTrades,
+      skippedNoQualifying,
+      skippedNoResolved,
       skippedNoTier,
-      tier1Count: tier1.length,
-      tier2Count: tier2.length,
-      tier3Count: tier3.length,
+      tier1Count:     tier1.length,
+      tier2Count:     tier2.length,
+      tier3Count:     tier3.length,
       multiTierCount: multiTier.length,
     },
   };
@@ -517,8 +575,9 @@ async function runScan() {
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(DATA_FILE, JSON.stringify(results, null, 2));
 
-  log(`=== Scan complete: T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length} ===`);
-  log(`    Skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noTier=${skippedNoTier}`);
+  log(`=== Scan complete ===`);
+  log(`  T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length}`);
+  log(`  Skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
   return results;
 }
 
