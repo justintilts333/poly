@@ -22,11 +22,13 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
+      - name: Install dependencies
+        run: npm install --production
+
       - name: Rsync files to VPS
         run: |
           rsync -az --delete \
             --exclude='.git' \
-            --exclude='node_modules' \
             --exclude='data' \
             -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=1 -o ServerAliveCountMax=120" \
             ./ ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/polymarket-scanner/
@@ -45,7 +47,6 @@ jobs:
                echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Deploy triggered" >> "$LOG"
 
                cd "$APP_DIR"
-               npm install --production || exit 1
 
                # Kill any running scanner and start a fresh one (fully detached)
                pkill -KILL -f "node.*scanner.js" 2>/dev/null || true
