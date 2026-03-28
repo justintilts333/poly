@@ -3,55 +3,46 @@ name: Deploy to VPS
 on:
   push:
     branches:
-      - claude/polymarket-wallet-scanner-ofqu0
+      - 'claude/**'
 
 jobs:
   deploy:
-    name: SSH Deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            APP_DIR="/opt/polymarket-scanner"
+            BRANCH="${{ github.ref_name }}"
+            LOG_FILE="/var/log/polymarket-scanner.log"
 
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+            echo "=== Deploying branch: $BRANCH ==="
 
-      - name: Install dependencies
-        run: npm install --production
+            if [ -d "$APP_DIR/.git" ]; then
+              cd "$APP_DIR"
+              git fetch origin "$BRANCH"
+              git reset --hard "origin/$BRANCH"
+            else
+              git clone --branch "$BRANCH" https://github.com/justintilts333/poly.git "$APP_DIR"
+              cd "$APP_DIR"
+            fi
 
-      - name: Rsync files to VPS
-        run: |
-          rsync -az --delete \
-            --exclude='.git' \
-            --exclude='data' \
-            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=1 -o ServerAliveCountMax=120" \
-            ./ ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/polymarket-scanner/
+            cd "$APP_DIR"
+            npm install --production
 
-      - name: Restart services on VPS
-        run: |
-          ssh -i ~/.ssh/deploy_key \
-              -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=30 \
-              -o ServerAliveInterval=1 \
-              -o ServerAliveCountMax=120 \
-              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
-              'bash /opt/polymarket-scanner/scripts/restart.sh'
+            # Restart web server via PM2
+            if pm2 list | grep -q polymarket-scanner; then
+              pm2 restart polymarket-scanner
+            else
+              pm2 start server.js --name polymarket-scanner --restart-delay=3000 --max-restarts=10
+              pm2 save
+            fi
 
-      - name: Verify dashboard is up
-        run: |
-          sleep 5
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            --max-time 15 \
-            "http://${{ secrets.VPS_HOST }}:3000/health" || echo "000")
-          echo "Health check HTTP status: $HTTP_CODE"
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "WARNING: Dashboard not responding yet (may still be starting)"
-          else
-            echo "Dashboard is live!"
-          fi
+            echo "=== Deploy complete ==="
+            pm2 status polymarket-scanner
