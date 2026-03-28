@@ -35,8 +35,9 @@ jobs:
 
             cd "$APP_DIR"
             npm install --production
+            cd "$APP_DIR/mcp-polymarket" && npm install --production && cd "$APP_DIR"
 
-            # Restart web server via PM2
+            # Restart dashboard via PM2
             if pm2 list | grep -q polymarket-scanner; then
               pm2 restart polymarket-scanner
             else
@@ -44,5 +45,13 @@ jobs:
               pm2 save
             fi
 
+            # Restart MCP server via PM2
+            if pm2 list | grep -q polymarket-mcp; then
+              pm2 restart polymarket-mcp
+            else
+              pm2 start mcp-polymarket/server.js --name polymarket-mcp --restart-delay=3000 --max-restarts=10
+              pm2 save
+            fi
+
             echo "=== Deploy complete ==="
-            pm2 status polymarket-scanner
+            pm2 status

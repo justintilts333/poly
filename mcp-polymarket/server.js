@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import https from 'https';
+import http from 'http';
+import express from 'express';
 
+const PORT = process.env.MCP_PORT || 3001;
+
+// ── Polymarket API base URLs ───────────────────────────────────────────────────
 const DATA_API        = 'https://data-api.polymarket.com';
 const GAMMA_API       = 'https://gamma-api.polymarket.com';
 const LEADERBOARD_API = 'https://leaderboard-api.polymarket.com';
@@ -22,112 +27,175 @@ function fetchJSON(url) {
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout fetching ${url}`)); });
   });
 }
 
-const server = new Server(
-  { name: 'mcp-polymarket', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-);
+// ── MCP Server definition ──────────────────────────────────────────────────────
+function createMcpServer() {
+  const server = new Server(
+    { name: 'mcp-polymarket', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'get_activity',
-      description: 'Fetch trade activity for a wallet from Polymarket data-api. Returns BUY/SELL/REDEEM events with fields: type, side, timestamp, conditionId, outcomeIndex, price, usdcSize, size.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          address: { type: 'string', description: 'Wallet proxy address' },
-          limit:   { type: 'number', description: 'Max records (default 20)' },
-          offset:  { type: 'number', description: 'Pagination offset (default 0)' },
-        },
-        required: ['address'],
-      },
-    },
-    {
-      name: 'get_positions',
-      description: 'Fetch current positions for a wallet. Returns per-market positions with cashPnl, realizedPnl, avgPrice, curPrice, conditionId, outcomeIndex.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          address: { type: 'string', description: 'Wallet proxy address' },
-          limit:   { type: 'number', description: 'Max records (default 50)' },
-        },
-        required: ['address'],
-      },
-    },
-    {
-      name: 'get_markets',
-      description: 'Fetch markets from Polymarket gamma-api. Filter by active/closed status, supports pagination.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          limit:  { type: 'number', description: 'Max records (default 10)' },
-          offset: { type: 'number', description: 'Pagination offset (default 0)' },
-          active: { type: 'boolean', description: 'Filter active markets (default true)' },
-          closed: { type: 'boolean', description: 'Filter closed markets (default false)' },
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: 'get_activity',
+        description: 'Fetch trade activity for a wallet. Returns BUY/SELL/REDEEM events with fields: type, side, timestamp, conditionId, outcomeIndex, price, usdcSize, size.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            address: { type: 'string', description: 'Wallet proxy address' },
+            limit:   { type: 'number', description: 'Max records (default 20)' },
+            offset:  { type: 'number', description: 'Pagination offset (default 0)' },
+          },
+          required: ['address'],
         },
       },
-    },
-    {
-      name: 'get_leaderboard',
-      description: 'Fetch top traders from Polymarket leaderboard.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          window: { type: 'string', description: 'Time window: all, 1m, 1w (default 1w)' },
-          limit:  { type: 'number', description: 'Max records (default 10)' },
-          offset: { type: 'number', description: 'Pagination offset (default 0)' },
+      {
+        name: 'get_positions',
+        description: 'Fetch current positions for a wallet. Returns per-market positions with cashPnl, realizedPnl, avgPrice, curPrice, conditionId, outcomeIndex.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            address: { type: 'string', description: 'Wallet proxy address' },
+            limit:   { type: 'number', description: 'Max records (default 50)' },
+          },
+          required: ['address'],
         },
       },
-    },
-  ],
-}));
+      {
+        name: 'get_markets',
+        description: 'Fetch markets from Polymarket. Filter by active/closed, supports pagination.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit:  { type: 'number', description: 'Max records (default 10)' },
+            offset: { type: 'number', description: 'Pagination offset (default 0)' },
+            active: { type: 'boolean', description: 'Filter active markets (default true)' },
+            closed: { type: 'boolean', description: 'Filter closed markets (default false)' },
+          },
+        },
+      },
+      {
+        name: 'get_leaderboard',
+        description: 'Fetch top traders from Polymarket leaderboard.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            window: { type: 'string', description: 'Time window: all, 1m, 1w (default 1w)' },
+            limit:  { type: 'number', description: 'Max records (default 10)' },
+            offset: { type: 'number', description: 'Pagination offset (default 0)' },
+          },
+        },
+      },
+      {
+        name: 'get_logs',
+        description: 'Fetch the last N lines from the scanner log file on the VPS.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            lines: { type: 'number', description: 'Number of lines to return (default 100)' },
+          },
+        },
+      },
+      {
+        name: 'trigger_scan',
+        description: 'Trigger a fresh wallet scan on the VPS in the background.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+    ],
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    try {
+      let url;
 
-  try {
-    let url;
+      if (name === 'get_activity') {
+        const limit  = args.limit  ?? 20;
+        const offset = args.offset ?? 0;
+        url = `${DATA_API}/activity?user=${args.address}&limit=${limit}&offset=${offset}&sortBy=TIMESTAMP&ascending=false`;
+        const { status, body } = await fetchJSON(url);
+        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
 
-    if (name === 'get_activity') {
-      const limit  = args.limit  ?? 20;
-      const offset = args.offset ?? 0;
-      url = `${DATA_API}/activity?user=${args.address}&limit=${limit}&offset=${offset}&sortBy=TIMESTAMP&ascending=false`;
-    } else if (name === 'get_positions') {
-      const limit = args.limit ?? 50;
-      url = `${DATA_API}/positions?user=${args.address}&limit=${limit}`;
-    } else if (name === 'get_markets') {
-      const limit  = args.limit  ?? 10;
-      const offset = args.offset ?? 0;
-      const active = args.active ?? true;
-      const closed = args.closed ?? false;
-      url = `${GAMMA_API}/markets?limit=${limit}&offset=${offset}&active=${active}&closed=${closed}`;
-    } else if (name === 'get_leaderboard') {
-      const window = args.window ?? '1w';
-      const limit  = args.limit  ?? 10;
-      const offset = args.offset ?? 0;
-      url = `${LEADERBOARD_API}/l/rankings?window=${window}&limit=${limit}&offset=${offset}`;
-    } else {
-      throw new Error(`Unknown tool: ${name}`);
+      } else if (name === 'get_positions') {
+        const limit = args.limit ?? 50;
+        url = `${DATA_API}/positions?user=${args.address}&limit=${limit}`;
+        const { status, body } = await fetchJSON(url);
+        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+
+      } else if (name === 'get_markets') {
+        const limit  = args.limit  ?? 10;
+        const offset = args.offset ?? 0;
+        const active = args.active ?? true;
+        const closed = args.closed ?? false;
+        url = `${GAMMA_API}/markets?limit=${limit}&offset=${offset}&active=${active}&closed=${closed}`;
+        const { status, body } = await fetchJSON(url);
+        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+
+      } else if (name === 'get_leaderboard') {
+        const window = args.window ?? '1w';
+        const limit  = args.limit  ?? 10;
+        const offset = args.offset ?? 0;
+        url = `${LEADERBOARD_API}/l/rankings?window=${window}&limit=${limit}&offset=${offset}`;
+        const { status, body } = await fetchJSON(url);
+        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+
+      } else if (name === 'get_logs') {
+        const lines = args.lines ?? 100;
+        const { execSync } = await import('child_process');
+        const output = execSync(`tail -n ${lines} /var/log/polymarket-scanner.log 2>/dev/null || echo "Log file not found"`, { encoding: 'utf8' });
+        return { content: [{ type: 'text', text: output }] };
+
+      } else if (name === 'trigger_scan') {
+        const { spawn } = await import('child_process');
+        const child = spawn('node', ['/opt/polymarket-scanner/scanner.js'], {
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env },
+        });
+        child.unref();
+        return { content: [{ type: 'text', text: `Scanner triggered. PID: ${child.pid}. Follow with get_logs.` }] };
+
+      } else {
+        throw new Error(`Unknown tool: ${name}`);
+      }
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
     }
+  });
 
-    const { status, body } = await fetchJSON(url);
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ status, url, data: body }, null, 2),
-      }],
-    };
-  } catch (err) {
-    return {
-      content: [{ type: 'text', text: `Error: ${err.message}` }],
-      isError: true,
-    };
-  }
+  return server;
+}
+
+// ── HTTP/SSE Express server ────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+
+const transports = new Map();
+
+app.get('/sse', async (req, res) => {
+  const server = createMcpServer();
+  const transport = new SSEServerTransport('/messages', res);
+  transports.set(transport.sessionId, transport);
+  res.on('close', () => transports.delete(transport.sessionId));
+  await server.connect(transport);
 });
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+app.post('/messages', async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports.get(sessionId);
+  if (!transport) return res.status(404).send('Session not found');
+  await transport.handlePostMessage(req, res, req.body);
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Polymarket MCP server running at http://0.0.0.0:${PORT}/sse`);
+});

@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "polymarket": {
-      "command": "node",
-      "args": ["/home/user/poly/mcp-polymarket/server.js"]
+      "url": "http://165.245.189.200:3001/sse"
     }
   }
 }

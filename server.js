@@ -4,6 +4,9 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { execSync, spawn } = require('child_process');
+
+const LOG_FILE = '/var/log/polymarket-scanner.log';
 
 const PORT = 3000;
 const DATA_FILE = path.join(__dirname, 'data', 'results.json');
@@ -245,6 +248,34 @@ app.get('/api/results', (req, res) => {
   const results = loadResults();
   if (!results) return res.status(404).json({ error: 'No scan data yet' });
   res.json(results);
+});
+
+app.get('/api/logs', (req, res) => {
+  const lines = Math.min(parseInt(req.query.lines || '100', 10), 2000);
+  try {
+    const output = execSync(`tail -n ${lines} ${LOG_FILE} 2>/dev/null || echo "Log file not found"`, { encoding: 'utf8' });
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.send(output);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/scan/trigger', (req, res) => {
+  try {
+    const existing = execSync("pgrep -f 'node.*scanner.js' || true", { encoding: 'utf8' }).trim();
+    if (existing) {
+      return res.json({ status: 'already_running', pids: existing.split('\n') });
+    }
+    const child = spawn('node', [path.join(__dirname, 'scanner.js')], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    res.json({ status: 'triggered', pid: child.pid });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));

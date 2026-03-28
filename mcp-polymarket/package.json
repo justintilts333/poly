@@ -4,6 +4,7 @@
   "type": "module",
   "main": "server.js",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.28.0"
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "express": "^5.2.1"
   }
 }
