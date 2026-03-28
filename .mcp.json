@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "polymarket": {
-      "url": "http://165.245.189.200:3001/sse"
+      "type": "http",
+      "url": "http://165.245.189.200:3001/mcp"
     }
   }
 }

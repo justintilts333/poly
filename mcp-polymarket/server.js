@@ -1,14 +1,12 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import https from 'https';
-import http from 'http';
 import express from 'express';
 
 const PORT = process.env.MCP_PORT || 3001;
 
-// ── Polymarket API base URLs ───────────────────────────────────────────────────
 const DATA_API        = 'https://data-api.polymarket.com';
 const GAMMA_API       = 'https://gamma-api.polymarket.com';
 const LEADERBOARD_API = 'https://leaderboard-api.polymarket.com';
@@ -31,7 +29,6 @@ function fetchJSON(url) {
   });
 }
 
-// ── MCP Server definition ──────────────────────────────────────────────────────
 function createMcpServer() {
   const server = new Server(
     { name: 'mcp-polymarket', version: '1.0.0' },
@@ -103,10 +100,7 @@ function createMcpServer() {
       {
         name: 'trigger_scan',
         description: 'Trigger a fresh wallet scan on the VPS in the background.',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
+        inputSchema: { type: 'object', properties: {} },
       },
     ],
   }));
@@ -114,53 +108,42 @@ function createMcpServer() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     try {
-      let url;
-
       if (name === 'get_activity') {
-        const limit  = args.limit  ?? 20;
-        const offset = args.offset ?? 0;
-        url = `${DATA_API}/activity?user=${args.address}&limit=${limit}&offset=${offset}&sortBy=TIMESTAMP&ascending=false`;
-        const { status, body } = await fetchJSON(url);
-        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+        const { status, body } = await fetchJSON(
+          `${DATA_API}/activity?user=${args.address}&limit=${args.limit ?? 20}&offset=${args.offset ?? 0}&sortBy=TIMESTAMP&ascending=false`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({ status, data: body }, null, 2) }] };
 
       } else if (name === 'get_positions') {
-        const limit = args.limit ?? 50;
-        url = `${DATA_API}/positions?user=${args.address}&limit=${limit}`;
-        const { status, body } = await fetchJSON(url);
-        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+        const { status, body } = await fetchJSON(
+          `${DATA_API}/positions?user=${args.address}&limit=${args.limit ?? 50}`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({ status, data: body }, null, 2) }] };
 
       } else if (name === 'get_markets') {
-        const limit  = args.limit  ?? 10;
-        const offset = args.offset ?? 0;
-        const active = args.active ?? true;
-        const closed = args.closed ?? false;
-        url = `${GAMMA_API}/markets?limit=${limit}&offset=${offset}&active=${active}&closed=${closed}`;
-        const { status, body } = await fetchJSON(url);
-        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+        const { status, body } = await fetchJSON(
+          `${GAMMA_API}/markets?limit=${args.limit ?? 10}&offset=${args.offset ?? 0}&active=${args.active ?? true}&closed=${args.closed ?? false}`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({ status, data: body }, null, 2) }] };
 
       } else if (name === 'get_leaderboard') {
-        const window = args.window ?? '1w';
-        const limit  = args.limit  ?? 10;
-        const offset = args.offset ?? 0;
-        url = `${LEADERBOARD_API}/l/rankings?window=${window}&limit=${limit}&offset=${offset}`;
-        const { status, body } = await fetchJSON(url);
-        return { content: [{ type: 'text', text: JSON.stringify({ status, url, data: body }, null, 2) }] };
+        const { status, body } = await fetchJSON(
+          `${LEADERBOARD_API}/l/rankings?window=${args.window ?? '1w'}&limit=${args.limit ?? 10}&offset=${args.offset ?? 0}`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({ status, data: body }, null, 2) }] };
 
       } else if (name === 'get_logs') {
-        const lines = args.lines ?? 100;
         const { execSync } = await import('child_process');
-        const output = execSync(`tail -n ${lines} /var/log/polymarket-scanner.log 2>/dev/null || echo "Log file not found"`, { encoding: 'utf8' });
+        const output = execSync(`tail -n ${args.lines ?? 100} /var/log/polymarket-scanner.log 2>/dev/null || echo "Log file not found"`, { encoding: 'utf8' });
         return { content: [{ type: 'text', text: output }] };
 
       } else if (name === 'trigger_scan') {
         const { spawn } = await import('child_process');
         const child = spawn('node', ['/opt/polymarket-scanner/scanner.js'], {
-          detached: true,
-          stdio: 'ignore',
-          env: { ...process.env },
+          detached: true, stdio: 'ignore',
         });
         child.unref();
-        return { content: [{ type: 'text', text: `Scanner triggered. PID: ${child.pid}. Follow with get_logs.` }] };
+        return { content: [{ type: 'text', text: `Scanner triggered. PID: ${child.pid}` }] };
 
       } else {
         throw new Error(`Unknown tool: ${name}`);
@@ -173,29 +156,19 @@ function createMcpServer() {
   return server;
 }
 
-// ── HTTP/SSE Express server ────────────────────────────────────────────────────
+// ── HTTP server using StreamableHTTP transport ─────────────────────────────────
 const app = express();
 app.use(express.json());
 
-const transports = new Map();
-
-app.get('/sse', async (req, res) => {
+app.post('/mcp', async (req, res) => {
   const server = createMcpServer();
-  const transport = new SSEServerTransport('/messages', res);
-  transports.set(transport.sessionId, transport);
-  res.on('close', () => transports.delete(transport.sessionId));
+  const transport = new StreamableHTTPServerTransport({ sessionIdHeader: 'mcp-session-id' });
   await server.connect(transport);
-});
-
-app.post('/messages', async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports.get(sessionId);
-  if (!transport) return res.status(404).send('Session not found');
-  await transport.handlePostMessage(req, res, req.body);
+  await transport.handleRequest(req, res, req.body);
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Polymarket MCP server running at http://0.0.0.0:${PORT}/sse`);
+  console.log(`Polymarket MCP server (HTTP) running at http://0.0.0.0:${PORT}/mcp`);
 });
