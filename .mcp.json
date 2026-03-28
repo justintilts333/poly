@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "polymarket": {
+      "command": "node",
+      "args": ["/home/user/poly/mcp-polymarket/server.js"]
+    }
+  }
+}
