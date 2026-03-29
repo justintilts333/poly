@@ -7,7 +7,7 @@ APP_DIR="/opt/polymarket-scanner"
 LOG_FILE="/var/log/polymarket-scanner.log"
 REPO="https://github.com/justintilts333/poly.git"
 BRANCH="claude/polymarket-wallet-scanner-ofqu0"
-HEISENBERG_API_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc5OTUzODIxLCJpYXQiOjE3NzQ3Njk4MjEsImp0aSI6IjZhYjc3ZjdmYjhjOTRhYTA4N2FjNjM5MDJhMjdiNzNjIiwidXNlcl9pZCI6Njk4LCJzY29wZSI6ImxhdW5jaHBhZDphZ2VudC1yZWFkLHJldHJpZXZlcjplY2hvLWdlbmVyYXRpb24scmV0cmlldmVyOmZlYXR1cmUtZXh0cmFjdGlvbix1c2VyOnJlYWQscmV0cmlldmVyOmFnZW50LW9wdGlvbi1yZXRyaWV2YWwsbGF1bmNocGFkOmFnZW50LWNyZWF0aW9uLGxhdW5jaHBhZDphZ2VudC11cGRhdGUsdXNlcjp3cml0ZSxyZXRyaWV2ZXI6c2VtYW50aWMtcmV0cmlldmFsLGxhdW5jaHBhZDplY2hvLXN0eWxlLWNyZWF0aW9uIiwidG9rZW5fbmFtZSI6ImJhc2VfbG9naW4ifQ.MvKFDjT3EtRU1U0MtLfwNilurkVYePUvQEJWecJCpPY"
+export HEISENBERG_API_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc5OTUzODIxLCJpYXQiOjE3NzQ3Njk4MjEsImp0aSI6IjZhYjc3ZjdmYjhjOTRhYTA4N2FjNjM5MDJhMjdiNzNjIiwidXNlcl9pZCI6Njk4LCJzY29wZSI6ImxhdW5jaHBhZDphZ2VudC1yZWFkLHJldHJpZXZlcjplY2hvLWdlbmVyYXRpb24scmV0cmlldmVyOmZlYXR1cmUtZXh0cmFjdGlvbix1c2VyOnJlYWQscmV0cmlldmVyOmFnZW50LW9wdGlvbi1yZXRyaWV2YWwsbGF1bmNocGFkOmFnZW50LWNyZWF0aW9uLGxhdW5jaHBhZDphZ2VudC11cGRhdGUsdXNlcjp3cml0ZSxyZXRyaWV2ZXI6c2VtYW50aWMtcmV0cmlldmFsLGxhdW5jaHBhZDplY2hvLXN0eWxlLWNyZWF0aW9uIiwidG9rZW5fbmFtZSI6ImJhc2VfbG9naW4ifQ.MvKFDjT3EtRU1U0MtLfwNilurkVYePUvQEJWecJCpPY"
 
 echo "=== Polymarket Scanner — First-Time VPS Setup ==="
 
@@ -49,9 +49,9 @@ fi
 mkdir -p "$APP_DIR/data"
 
 # --- Write env file ---
-cat > "$APP_DIR/.env.sh" <<EOF
+cat > "$APP_DIR/.env.sh" <<ENVEOF
 export HEISENBERG_API_KEY="$HEISENBERG_API_KEY"
-EOF
+ENVEOF
 chmod 600 "$APP_DIR/.env.sh"
 echo "Env file written to $APP_DIR/.env.sh"
 

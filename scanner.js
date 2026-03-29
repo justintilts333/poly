@@ -544,6 +544,7 @@ function assignTiers(m) {
   if (!m || m.totalPnl <= 0) return tiers;
   // Use resolvedCount (not qualifyingCount) for tier thresholds
   const n = m.resolvedCount;
+  if (n >= 20 && m.winRate >= 0.70) tiers.push('S');
   if (n >= 30 && m.winRate >= 0.60) tiers.push(1);
   if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
   if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
@@ -583,7 +584,7 @@ async function runScan() {
   const allWallets = [...holderWallets];
   log(`Segment 2 candidates: ${allWallets.length} (market holders)`);
 
-  const tier1 = [], tier2 = [], tier3 = [];
+  const tierS = [], tier1 = [], tier2 = [], tier3 = [];
   const seen  = new Map();
   let processed = 0;
   let skippedBot = 0, skippedActivity = 0, skippedNoTrades = 0,
@@ -653,9 +654,10 @@ async function runScan() {
       };
 
       seen.set(address, record);
-      if (tiers.includes(1)) tier1.push(record);
-      if (tiers.includes(2)) tier2.push(record);
-      if (tiers.includes(3)) tier3.push(record);
+      if (tiers.includes('S')) tierS.push(record);
+      if (tiers.includes(1))   tier1.push(record);
+      if (tiers.includes(2))   tier2.push(record);
+      if (tiers.includes(3))   tier3.push(record);
 
     } catch (e) {
       logError(`Evaluate ${address}`, e);
@@ -666,7 +668,7 @@ async function runScan() {
 
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
   const sortFn = (a, b) => b.score - a.score;
-  [tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
+  [tierS, tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
 
   const results = {
     scanTime: new Date().toISOString(),
@@ -677,7 +679,7 @@ async function runScan() {
     },
     segment2: {
       source:      'Market holders — own criteria (BUY <$0.50, 14d resolution window)',
-      tier1, tier2, tier3, multiTier,
+      tierS, tier1, tier2, tier3, multiTier,
       stats: {
         candidates:          allWallets.length,
         processed,
@@ -687,6 +689,7 @@ async function runScan() {
         skippedNoQualifying,
         skippedNoResolved,
         skippedNoTier,
+        tierSCount:     tierS.length,
         tier1Count:     tier1.length,
         tier2Count:     tier2.length,
         tier3Count:     tier3.length,
@@ -701,7 +704,7 @@ async function runScan() {
 
   log(`=== Scan complete ===`);
   log(`  Segment 1 (Falcon): ${segment1.length} wallets`);
-  log(`  Segment 2 (own criteria): T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length}`);
+  log(`  Segment 2 (own criteria): S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length}`);
   log(`  Segment 2 skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
   return results;
 }
