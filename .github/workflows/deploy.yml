@@ -53,5 +53,13 @@ jobs:
               pm2 save
             fi
 
+            # Restart executor via PM2
+            if pm2 list | grep -q polymarket-executor; then
+              pm2 restart polymarket-executor
+            else
+              pm2 start executor.js --name polymarket-executor --restart-delay=5000 --max-restarts=10
+              pm2 save
+            fi
+
             echo "=== Deploy complete ==="
             pm2 status
