@@ -301,7 +301,7 @@ async function fetchMarketHolders(topMarkets) {
 
 // ── Wallet positions (cashPnl / realizedPnl) ──────────────────────────────────
 async function fetchWalletPositions(address) {
-  const posMap = new Map(); // "conditionId:outcomeIndex" → { cashPnl, realizedPnl }
+  const posMap = new Map(); // conditionId → { cashPnl, realizedPnl } (aggregated across outcomes)
   try {
     const url = `${DATA_API}/positions?user=${address}&limit=500`;
     const data = await fetchJSON(url, 2, 1500);
@@ -309,10 +309,12 @@ async function fetchWalletPositions(address) {
     for (const p of rows) {
       const cid = (p.conditionId || p.condition_id || '').toLowerCase();
       if (!cid) continue;
-      const key = `${cid}:${p.outcomeIndex ?? ''}`;
-      posMap.set(key, {
-        cashPnl:     parseFloat(p.cashPnl     ?? 0),
-        realizedPnl: parseFloat(p.realizedPnl ?? 0),
+      const cashPnl     = parseFloat(p.cashPnl     ?? 0);
+      const realizedPnl = parseFloat(p.realizedPnl ?? 0);
+      const existing    = posMap.get(cid);
+      posMap.set(cid, {
+        cashPnl:     (existing?.cashPnl     ?? 0) + cashPnl,
+        realizedPnl: (existing?.realizedPnl ?? 0) + realizedPnl,
       });
     }
   } catch (_) {}
@@ -454,8 +456,9 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
   });
 }
 
-// ── STEP 4: Metrics on qualifying trades ──────────────────────────────────────
-// posMap: Map<"conditionId:outcomeIndex" → { cashPnl, realizedPnl }>
+// ── STEP 4: Metrics on qualifying trades (deduplicated per market) ────────────
+// Each conditionId counts as one win or one loss, regardless of how many
+// individual BUY trades the wallet placed on that market.
 function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap) {
   if (!qualifyingTrades.length) return null;
 
@@ -463,70 +466,83 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
   const cutoff7d  = now - 7  * 86400000;
   const cutoff30d = now - 30 * 86400000;
 
+  // Group qualifying trades by conditionId — one win/loss decision per market
+  const byMarket = new Map();
+  for (const t of qualifyingTrades) {
+    const cid = (t.conditionId || '').toLowerCase();
+    if (!byMarket.has(cid)) byMarket.set(cid, []);
+    byMarket.get(cid).push(t);
+  }
+
   let wins = 0, losses = 0;
   let wins7d = 0, total7d = 0;
   let wins30d = 0, total30d = 0;
-  let totalEntryPrice = 0;
+  let totalEntryPrice = 0, totalTradeCount = 0;
   let totalPnl = 0;
-  let totalReturnMultiple = 0; // sum of (1/entryPrice) for wins → entry vs resolution ratio
+  let totalReturnMultiple = 0;
 
-  for (const t of qualifyingTrades) {
-    const cid   = (t.conditionId || '').toLowerCase();
-    const key   = `${cid}:${t.outcomeIndex ?? ''}`;
-    const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 0);
-    const usdcSize = parseFloat(t.usdcSize ?? 0);
-    const shares   = parseFloat(t.size ?? 0);
-
-    let ts = t.timestamp ?? 0;
-    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
-
-    if (!isNaN(price)) totalEntryPrice += price;
-
-    // Win detection: prefer cashPnl/realizedPnl from /positions, fall back to REDEEM event
-    const posData   = posMap ? posMap.get(key) : null;
-    const hasPosWin = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
-    const redeemTs  = redeemByKey.get(cid);
-    const isWin     = hasPosWin || !!redeemTs;
-
-    // Loss: market confirmed resolved but no positive PnL signal
+  for (const [cid, trades] of byMarket) {
+    const posData    = posMap ? posMap.get(cid) : null;
+    const hasPosWin  = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
+    const redeemTs   = redeemByKey.get(cid);
+    const isWin      = hasPosWin || !!redeemTs;
     const marketResolved = resolvedCids.has(cid) ||
       (posData && (posData.cashPnl !== 0 || posData.realizedPnl !== 0));
     const isLoss = !isWin && marketResolved;
 
-    if (!isWin && !isLoss) continue; // unresolved — skip for win rate
+    if (!isWin && !isLoss) continue; // still unresolved — skip
+
+    // Use latest trade timestamp in this market for time-window bucketing
+    let marketTs = 0;
+    for (const t of trades) {
+      let ts = t.timestamp ?? 0;
+      if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+      if (ts > marketTs) marketTs = ts;
+    }
+
+    // Accumulate entry price stats across all trades in market
+    for (const t of trades) {
+      const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 0);
+      if (!isNaN(price) && price > 0) { totalEntryPrice += price; totalTradeCount++; }
+    }
 
     if (isWin) {
       wins++;
-      // PnL: shares × $1 payout minus cost; fallback to position realizedPnl if available
       if (posData && posData.realizedPnl !== 0) {
         totalPnl += posData.realizedPnl;
       } else {
-        totalPnl += shares > 0 ? shares - usdcSize : usdcSize * (1 / Math.max(price, 0.001) - 1);
+        for (const t of trades) {
+          const usdcSize = parseFloat(t.usdcSize ?? 0);
+          const shares   = parseFloat(t.size ?? 0);
+          const price    = parseFloat(t.price ?? 0);
+          totalPnl += shares > 0 ? shares - usdcSize : usdcSize * (1 / Math.max(price, 0.001) - 1);
+        }
       }
-      // Return multiple: resolution price ($1) / entry price
-      if (price > 0 && price < 1) totalReturnMultiple += 1 / price;
+      const avgPrice = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
+      if (avgPrice > 0 && avgPrice < 1) totalReturnMultiple += 1 / avgPrice;
     } else {
       losses++;
-      totalPnl -= usdcSize > 0 ? usdcSize : price;
+      totalPnl -= trades.reduce((s, t) => s + parseFloat(t.usdcSize ?? 0), 0);
     }
 
-    if (ts >= cutoff7d)  { total7d++;  if (isWin) wins7d++;  }
-    if (ts >= cutoff30d) { total30d++; if (isWin) wins30d++; }
+    if (marketTs >= cutoff7d)  { total7d++;  if (isWin) wins7d++;  }
+    if (marketTs >= cutoff30d) { total30d++; if (isWin) wins30d++; }
   }
 
   const totalResolved = wins + losses;
   if (totalResolved === 0) return null;
 
-  const winRate    = wins / totalResolved;
-  const winRate7d  = total7d  > 0 ? wins7d  / total7d  : NaN;
-  const winRate30d = total30d > 0 ? wins30d / total30d : NaN;
-  const avgEntryPrice    = qualifyingTrades.length > 0 ? totalEntryPrice / qualifyingTrades.length : 0;
+  const winRate           = wins / totalResolved;
+  const winRate7d         = total7d  > 0 ? wins7d  / total7d  : NaN;
+  const winRate30d        = total30d > 0 ? wins30d / total30d : NaN;
+  const avgEntryPrice     = totalTradeCount > 0 ? totalEntryPrice / totalTradeCount : 0;
   const avgReturnMultiple = wins > 0 ? totalReturnMultiple / wins : 0;
-  const lastTradeTs      = getLastTradeTs(allTrades);
+  const lastTradeTs       = getLastTradeTs(allTrades);
 
   return {
-    qualifyingCount: qualifyingTrades.length,
-    resolvedCount:   totalResolved,
+    qualifyingCount:  qualifyingTrades.length,
+    distinctMarkets:  byMarket.size,
+    resolvedCount:    totalResolved,      // distinct markets resolved
     wins, losses,
     winRate, winRate7d, winRate30d,
     totalPnl,
@@ -636,21 +652,22 @@ async function runScan() {
 
       const record = {
         address,
-        totalQualifying:    m.qualifyingCount,
-        resolvedCount:      m.resolvedCount,
-        wins:               m.wins,
-        losses:             m.losses,
-        winRate:            m.winRate,
-        winRate7d:          m.winRate7d,
-        winRate30d:         m.winRate30d,
-        avgEntryPrice:      m.avgEntryPrice,
-        avgReturnMultiple:  m.avgReturnMultiple,
-        overallPnl:         m.totalPnl,
-        lastTradeDate:      m.lastTradeDate,
+        totalQualifyingTrades: m.qualifyingCount,
+        distinctMarkets:       m.distinctMarkets,
+        resolvedMarkets:       m.resolvedCount,
+        wins:                  m.wins,
+        losses:                m.losses,
+        winRate:               m.winRate,
+        winRate7d:             m.winRate7d,
+        winRate30d:            m.winRate30d,
+        avgEntryPrice:         m.avgEntryPrice,
+        avgReturnMultiple:     m.avgReturnMultiple,
+        overallPnl:            m.totalPnl,
+        lastTradeDate:         m.lastTradeDate,
         tiers,
         score,
-        total7dTrades:      m.total7d,
-        total30dTrades:     m.total30d,
+        total7dMarkets:        m.total7d,
+        total30dMarkets:       m.total30d,
       };
 
       seen.set(address, record);
@@ -667,6 +684,9 @@ async function runScan() {
   }
 
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
+  const top5ByPnl = [...seen.values()]
+    .sort((a, b) => b.overallPnl - a.overallPnl)
+    .slice(0, 5);
   const sortFn = (a, b) => b.score - a.score;
   [tierS, tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
 
@@ -679,6 +699,7 @@ async function runScan() {
     },
     segment2: {
       source:      'Market holders — own criteria (BUY <$0.50, 14d resolution window)',
+      top5ByPnl,
       tierS, tier1, tier2, tier3, multiTier,
       stats: {
         candidates:          allWallets.length,
