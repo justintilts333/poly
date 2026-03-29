@@ -24,15 +24,25 @@ Local CLI (you/me editing)
 **Branch:** `claude/polymarket-wallet-scanner-ofqu0`
 Always develop and push to this branch. Actions auto-deploys on push.
 
-## MCP Tools (Polymarket API — available in local CLI sessions)
-The `.mcp.json` connects to the VPS MCP server at `http://165.245.189.200:3001/mcp`.
-Available tools:
+## MCP Tools (available in local CLI sessions)
+
+### Polymarket (VPS proxy at `http://165.245.189.200:3001/mcp`)
 - `get_activity(address, limit, offset)` — wallet trade history
 - `get_positions(address, limit)` — wallet positions with cashPnl, realizedPnl
 - `get_markets(limit, offset, active, closed)` — market listings
 - `get_leaderboard(window, limit, offset)` — top traders (windows: all, 1m, 1w)
 - `get_logs(lines)` — tail the VPS scanner log
 - `trigger_scan()` — kick off a fresh scan on the VPS
+
+### Heisenberg / Falcon API (`https://narrative.agent.heisenberg.so/sse`)
+Agent-based API — one endpoint, switch data source by agent_id.
+API key stored in `.env` as `FALCON_API_TOKEN`.
+Key agents:
+- **584** — Falcon Score Leaderboard (trader quality ranking, better than native leaderboard)
+- **581** — Wallet 360 (60+ performance, behavior, and risk metrics per wallet)
+- **556** — Polymarket Trades (historical trades by wallet)
+- **569** — Polymarket PnL (realized PnL time series by wallet)
+- **579** — Polymarket Leaderboard (official PnL leaderboard)
 
 ## Scanner Logic (scanner.js)
 

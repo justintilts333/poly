@@ -3,6 +3,10 @@
     "polymarket": {
       "type": "http",
       "url": "http://165.245.189.200:3001/mcp"
+    },
+    "heisenberg": {
+      "type": "sse",
+      "url": "https://narrative.agent.heisenberg.so/sse"
     }
   }
 }
