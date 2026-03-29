@@ -103,49 +103,124 @@ function fetchJSON(url, retries = 3, delayMs = 2000) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── API base URLs ──────────────────────────────────────────────────────────────
-const DATA_API        = 'https://data-api.polymarket.com';
-const GAMMA_API       = 'https://gamma-api.polymarket.com';
-const LEADERBOARD_API = 'https://leaderboard-api.polymarket.com';
+const DATA_API          = 'https://data-api.polymarket.com';
+const GAMMA_API         = 'https://gamma-api.polymarket.com';
+const HEISENBERG_HOST   = 'narrative.agent.heisenberg.so';
+const HEISENBERG_KEY    = process.env.HEISENBERG_API_KEY || '';
 
-// ── Wallet discovery: leaderboard ─────────────────────────────────────────────
-async function fetchLeaderboardCandidates() {
-  log('Fetching leaderboard candidates...');
-  const wallets = new Set();
-  const windows = ['all', '1m', '1w'];
-  const limit = 100;
-
-  for (const window of windows) {
-    let offset = 0;
-    let pages = 0;
-    while (pages < 20) {
-      try {
-        const url = `${LEADERBOARD_API}/l/rankings?window=${window}&limit=${limit}&offset=${offset}`;
-        const data = await fetchJSON(url, 3, 2000);
-        const rows = Array.isArray(data) ? data : (data.data || data.rankings || data.results || []);
-        if (!rows.length) break;
-
-        if (offset === 0) {
-          log(`  [DEBUG] leaderboard window=${window} keys: ${Object.keys(rows[0] || {}).join(',')}`);
-        }
-        for (const row of rows) {
-          const addr = row.proxyWallet ?? row.proxy_wallet ?? row.wallet ?? row.address ?? row.user;
-          if (addr && typeof addr === 'string') wallets.add(addr.toLowerCase());
-        }
-        log(`  Leaderboard window=${window} offset=${offset}: ${rows.length} rows → ${wallets.size} total`);
-        if (rows.length < limit) break;
-        offset += limit;
-        pages++;
-        await sleep(300);
-      } catch (e) {
-        logError(`Leaderboard window=${window} offset=${offset}`, e);
-        break;
-      }
+// ── Segment 1: Heisenberg Falcon leaderboard (agent 584) ──────────────────────
+function fetchHeisenbergLeaderboard() {
+  return new Promise((resolve) => {
+    if (!HEISENBERG_KEY) {
+      log('HEISENBERG_API_KEY not set — skipping Segment 1');
+      return resolve([]);
     }
-    await sleep(500);
-  }
+    log('Fetching Heisenberg Falcon leaderboard (agent 584)...');
 
-  log(`Leaderboard candidates: ${wallets.size} wallets`);
-  return [...wallets];
+    let sessionPath = null;
+    const pending   = new Map();
+    let msgId       = 0;
+
+    function sendMsg(body) {
+      return new Promise((res, rej) => {
+        const payload = JSON.stringify(body);
+        const r = https.request({
+          hostname: HEISENBERG_HOST, path: sessionPath, method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${HEISENBERG_KEY}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+          timeout: 15000,
+        }, (response) => { response.resume(); });
+        r.on('error', rej);
+        r.write(payload); r.end();
+        if (body.id != null) {
+          pending.set(body.id, res);
+          setTimeout(() => {
+            if (pending.has(body.id)) { pending.delete(body.id); rej(new Error(`timeout id=${body.id}`)); }
+          }, 30000);
+        } else { res(null); }
+      });
+    }
+
+    async function runProtocol(sseReq) {
+      await sendMsg({ jsonrpc: '2.0', id: ++msgId, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'scanner', version: '1.0' } } });
+      await sendMsg({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
+      await sendMsg({ jsonrpc: '2.0', id: ++msgId, method: 'tools/call', params: { name: 'authenticate', arguments: { token: HEISENBERG_KEY } } });
+
+      const r = await sendMsg({
+        jsonrpc: '2.0', id: ++msgId, method: 'tools/call',
+        params: {
+          name: 'perform_parameterized_retrieval',
+          arguments: {
+            token: HEISENBERG_KEY,
+            agent_id: 584,
+            params: { wallet_address: 'ALL' },
+            pagination: { limit: 200, offset: 0 },
+            formatter_config: { format_type: 'raw' },
+          },
+        },
+      });
+
+      sseReq.destroy();
+
+      const text = r?.result?.content?.[0]?.text || '';
+      const parsed = JSON.parse(text);
+      const rows   = parsed?.data?.results || [];
+      log(`Heisenberg Segment 1: ${rows.length} wallets`);
+      return rows.map(w => ({
+        address:         (w.wallet || '').toLowerCase(),
+        hScore:          parseFloat(w.h_score        || 0),
+        tier:            w.tier                      || '',
+        leaderboardRank: w.leaderboard_rank          || null,
+        winRate15d:      parseFloat(w.win_rate_pct_15d || 0) / 100,
+        totalPnl15d:     parseFloat(w.total_pnl_15d  || 0),
+        roi15d:          parseFloat(w.roi_pct_15d    || 0) / 100,
+        sharpe15d:       parseFloat(w.sharpe_ratio_15d || 0),
+        trades15d:       parseInt(w.total_trades_15d || 0),
+        markets15d:      parseInt(w.markets_traded_15d || 0),
+        trajectory:      w.trajectory                || '',
+      }));
+    }
+
+    const req = https.get({
+      hostname: HEISENBERG_HOST, path: '/sse',
+      headers: { 'Authorization': `Bearer ${HEISENBERG_KEY}`, 'Accept': 'text/event-stream' },
+      timeout: 60000,
+    }, (res) => {
+      let buf = '', eventType = '';
+      res.on('data', chunk => {
+        buf += chunk.toString();
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          if (line.startsWith('event:')) { eventType = line.slice(6).trim(); }
+          else if (line.startsWith('data:')) {
+            const data = line.slice(5).trim();
+            if (eventType === 'endpoint' || data.startsWith('/messages')) {
+              sessionPath = data;
+              runProtocol(req).then(resolve).catch(err => {
+                logError('Heisenberg protocol error', err);
+                req.destroy();
+                resolve([]);
+              });
+            } else {
+              try {
+                const msg = JSON.parse(data);
+                if (msg.id != null && pending.has(msg.id)) {
+                  const cb = pending.get(msg.id); pending.delete(msg.id); cb(msg);
+                }
+              } catch (_) {}
+            }
+            eventType = '';
+          }
+        }
+      });
+      res.on('error', err => { logError('Heisenberg SSE stream error', err); resolve([]); });
+    });
+    req.on('error',   err => { logError('Heisenberg connect error', err);   resolve([]); });
+    req.on('timeout', ()  => { req.destroy(); logError('Heisenberg SSE timeout', null); resolve([]); });
+  });
 }
 
 // ── Short-resolution markets ───────────────────────────────────────────────────
@@ -328,12 +403,12 @@ function buildRedeemInfo(allTrades) {
     const cid = (t.conditionId || t.condition_id || '').toLowerCase();
     if (!cid) continue;
 
-    const key = `${cid}:${t.outcomeIndex ?? ''}`;
+    // outcomeIndex is always 999 in REDEEM events — key by conditionId only
     let ts = t.timestamp ?? 0;
     if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
 
-    if (!redeemByKey.has(key) || ts > redeemByKey.get(key)) {
-      redeemByKey.set(key, ts || Date.now());
+    if (!redeemByKey.has(cid) || ts > redeemByKey.get(cid)) {
+      redeemByKey.set(cid, ts || Date.now());
     }
     resolvedCids.add(cid);
   }
@@ -370,7 +445,7 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
 
     const inUpcomingShortMarket = shortConditionIds.size > 0 && shortConditionIds.has(cid);
 
-    const redeemTs = redeemByKey.get(key);
+    const redeemTs = redeemByKey.get(cid);
     const resolvedQuickly = redeemTs &&
       (redeemTs - buyTs) >= 0 &&
       (redeemTs - buyTs) <= maxResolutionMs;
@@ -410,7 +485,7 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
     // Win detection: prefer cashPnl/realizedPnl from /positions, fall back to REDEEM event
     const posData   = posMap ? posMap.get(key) : null;
     const hasPosWin = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
-    const redeemTs  = redeemByKey.get(key);
+    const redeemTs  = redeemByKey.get(cid);
     const isWin     = hasPosWin || !!redeemTs;
 
     // Loss: market confirmed resolved but no positive PnL signal
@@ -494,18 +569,19 @@ function computeScore(m) {
 
 // ── Main ───────────────────────────────────────────────────────────────────────
 async function runScan() {
-  log('=== Polymarket Wallet Scanner v2 (REDEEM-based win detection) ===');
+  log('=== Polymarket Wallet Scanner v3 (two-segment) ===');
 
-  const [leaderboardWallets, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
-    fetchLeaderboardCandidates(),
+  // Segment 1 (Heisenberg) and market data fetched in parallel
+  const [segment1, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
+    fetchHeisenbergLeaderboard(),
     fetchShortResolutionMarkets(14),
   ]);
 
   const holderWallets = await fetchMarketHolders(topMarkets);
 
-  const walletSet = new Set([...leaderboardWallets, ...holderWallets]);
-  const allWallets = [...walletSet];
-  log(`Total candidates: ${allWallets.length} (${leaderboardWallets.length} leaderboard + ${holderWallets.size} holders)`);
+  // Segment 2 candidates: market holders only
+  const allWallets = [...holderWallets];
+  log(`Segment 2 candidates: ${allWallets.length} (market holders)`);
 
   const tier1 = [], tier2 = [], tier3 = [];
   const seen  = new Map();
@@ -594,20 +670,28 @@ async function runScan() {
 
   const results = {
     scanTime: new Date().toISOString(),
-    tier1, tier2, tier3, multiTier,
-    stats: {
-      walletsScanned:    allWallets.length,
-      walletsProcessed:  processed,
-      skippedBot,
-      skippedActivity,
-      skippedNoTrades,
-      skippedNoQualifying,
-      skippedNoResolved,
-      skippedNoTier,
-      tier1Count:     tier1.length,
-      tier2Count:     tier2.length,
-      tier3Count:     tier3.length,
-      multiTierCount: multiTier.length,
+    segment1: {
+      source:      'Heisenberg Falcon Leaderboard (agent 584)',
+      wallets:     segment1,
+      count:       segment1.length,
+    },
+    segment2: {
+      source:      'Market holders — own criteria (BUY <$0.50, 14d resolution window)',
+      tier1, tier2, tier3, multiTier,
+      stats: {
+        candidates:          allWallets.length,
+        processed,
+        skippedBot,
+        skippedActivity,
+        skippedNoTrades,
+        skippedNoQualifying,
+        skippedNoResolved,
+        skippedNoTier,
+        tier1Count:     tier1.length,
+        tier2Count:     tier2.length,
+        tier3Count:     tier3.length,
+        multiTierCount: multiTier.length,
+      },
     },
   };
 
@@ -616,8 +700,9 @@ async function runScan() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(results, null, 2));
 
   log(`=== Scan complete ===`);
-  log(`  T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length}`);
-  log(`  Skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
+  log(`  Segment 1 (Falcon): ${segment1.length} wallets`);
+  log(`  Segment 2 (own criteria): T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length}`);
+  log(`  Segment 2 skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
   return results;
 }
 

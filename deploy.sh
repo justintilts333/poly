@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full first-time VPS setup script
+# Full VPS setup / redeploy script
 # Run on the VPS: bash deploy.sh
 set -e
 
@@ -7,6 +7,7 @@ APP_DIR="/opt/polymarket-scanner"
 LOG_FILE="/var/log/polymarket-scanner.log"
 REPO="https://github.com/justintilts333/poly.git"
 BRANCH="claude/polymarket-wallet-scanner-ofqu0"
+HEISENBERG_API_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzc5OTUzODIxLCJpYXQiOjE3NzQ3Njk4MjEsImp0aSI6IjZhYjc3ZjdmYjhjOTRhYTA4N2FjNjM5MDJhMjdiNzNjIiwidXNlcl9pZCI6Njk4LCJzY29wZSI6ImxhdW5jaHBhZDphZ2VudC1yZWFkLHJldHJpZXZlcjplY2hvLWdlbmVyYXRpb24scmV0cmlldmVyOmZlYXR1cmUtZXh0cmFjdGlvbix1c2VyOnJlYWQscmV0cmlldmVyOmFnZW50LW9wdGlvbi1yZXRyaWV2YWwsbGF1bmNocGFkOmFnZW50LWNyZWF0aW9uLGxhdW5jaHBhZDphZ2VudC11cGRhdGUsdXNlcjp3cml0ZSxyZXRyaWV2ZXI6c2VtYW50aWMtcmV0cmlldmFsLGxhdW5jaHBhZDplY2hvLXN0eWxlLWNyZWF0aW9uIiwidG9rZW5fbmFtZSI6ImJhc2VfbG9naW4ifQ.MvKFDjT3EtRU1U0MtLfwNilurkVYePUvQEJWecJCpPY"
 
 echo "=== Polymarket Scanner — First-Time VPS Setup ==="
 
@@ -47,21 +48,40 @@ fi
 
 mkdir -p "$APP_DIR/data"
 
+# --- Write env file ---
+cat > "$APP_DIR/.env.sh" <<EOF
+export HEISENBERG_API_KEY="$HEISENBERG_API_KEY"
+EOF
+chmod 600 "$APP_DIR/.env.sh"
+echo "Env file written to $APP_DIR/.env.sh"
+
 # --- npm install ---
 cd "$APP_DIR"
 npm install --production
+cd "$APP_DIR/mcp-polymarket"
+npm install --production 2>/dev/null || true
+cd "$APP_DIR"
 
-# --- PM2 setup ---
+# --- PM2: dashboard (port 3000) ---
 pm2 stop polymarket-scanner 2>/dev/null || true
 pm2 delete polymarket-scanner 2>/dev/null || true
 pm2 start server.js --name polymarket-scanner --restart-delay=3000 --max-restarts=10
+echo "Dashboard started on port 3000"
+
+# --- PM2: MCP server (port 3001) ---
+pm2 stop mcp-polymarket 2>/dev/null || true
+pm2 delete mcp-polymarket 2>/dev/null || true
+HEISENBERG_API_KEY="$HEISENBERG_API_KEY" pm2 start mcp-polymarket/server.js \
+  --name mcp-polymarket \
+  --restart-delay=3000 --max-restarts=10 \
+  --env HEISENBERG_API_KEY="$HEISENBERG_API_KEY"
+echo "MCP server started on port 3001"
+
 pm2 save
 pm2 startup systemd -u root --hp /root 2>/dev/null | grep "^sudo\|^systemctl" | bash || true
 
-echo "Web server started on port 3000"
-
 # --- Cron job (daily scanner at 08:00 UTC) ---
-CRON_JOB="0 8 * * * cd $APP_DIR && /usr/bin/node scanner.js >> $LOG_FILE 2>&1"
+CRON_JOB="0 8 * * * . $APP_DIR/.env.sh && cd $APP_DIR && /usr/bin/node scanner.js >> $LOG_FILE 2>&1"
 (crontab -l 2>/dev/null | grep -v 'polymarket\|scanner.js'; echo "$CRON_JOB") | crontab -
 echo "Cron job set: daily at 08:00 UTC"
 

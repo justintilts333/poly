@@ -26,21 +26,13 @@ fi
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15"
 
-echo "Copying files to VPS..."
-sshpass -p "$PASS" scp $SSH_OPTS -r \
-  "$LOCAL_DIR/scanner.js" \
-  "$LOCAL_DIR/server.js" \
-  "$LOCAL_DIR/package.json" \
-  "$LOCAL_DIR/deploy.sh" \
-  "${REMOTE_USER}@${VPS}:/tmp/"
+echo "Pushing latest commits to git..."
+cd "$LOCAL_DIR"
+git push origin HEAD 2>/dev/null || echo "(git push skipped or already up to date)"
 
-echo "Creating deploy bundle on VPS..."
+echo "Pulling latest on VPS and redeploying..."
 sshpass -p "$PASS" ssh $SSH_OPTS "${REMOTE_USER}@${VPS}" \
-  "mkdir -p /tmp/poly-deploy && mv /tmp/scanner.js /tmp/server.js /tmp/package.json /tmp/deploy.sh /tmp/poly-deploy/"
-
-echo "Running deploy script on VPS..."
-sshpass -p "$PASS" ssh $SSH_OPTS "${REMOTE_USER}@${VPS}" \
-  "bash /tmp/poly-deploy/deploy.sh"
+  "cd /opt/polymarket-scanner && git fetch origin claude/polymarket-wallet-scanner-ofqu0 && git reset --hard origin/claude/polymarket-wallet-scanner-ofqu0 && bash deploy.sh"
 
 echo ""
 echo "===================================================="

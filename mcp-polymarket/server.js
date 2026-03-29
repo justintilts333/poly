@@ -97,6 +97,17 @@ const TOOLS = [
     description: 'Trigger a fresh wallet scan on the VPS in the background.',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'get_results',
+    description: 'Return the latest scan results: Segment 1 (Heisenberg Falcon leaderboard wallets) and Segment 2 (own-criteria tier wallets). Pass segment="1" or "2" to filter, or omit for summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        segment: { type: 'string', description: 'Which segment to return: "1", "2", or "all" (default "all")' },
+        limit:   { type: 'number', description: 'Max wallets to return per tier (default 20)' },
+      },
+    },
+  },
 ];
 
 // ── Tool execution ─────────────────────────────────────────────────────────────
@@ -122,9 +133,56 @@ async function callTool(name, args) {
     return execSync(`tail -n ${lines} /var/log/polymarket-scanner.log 2>/dev/null || echo "Log not found"`, { encoding: 'utf8' });
   }
   if (name === 'trigger_scan') {
-    const child = spawn('node', ['/opt/polymarket-scanner/scanner.js'], { detached: true, stdio: 'ignore' });
+    const child = spawn('node', ['/opt/polymarket-scanner/scanner.js'], {
+      detached: true, stdio: 'ignore',
+      env: { ...process.env },
+    });
     child.unref();
     return `Scanner triggered. PID: ${child.pid}`;
+  }
+  if (name === 'get_results') {
+    const dataFile = '/opt/polymarket-scanner/data/results.json';
+    let raw;
+    try { raw = require('fs').readFileSync(dataFile, 'utf8'); }
+    catch (_) { return JSON.stringify({ error: 'No results file found. Run trigger_scan first.' }); }
+    const results = JSON.parse(raw);
+    const seg  = (args.segment || 'all').toString();
+    const lim  = Math.min(args.limit || 20, 200);
+
+    if (seg === '1') {
+      return JSON.stringify({
+        scanTime: results.scanTime,
+        segment1: { ...results.segment1, wallets: (results.segment1?.wallets || []).slice(0, lim) },
+      }, null, 2);
+    }
+    if (seg === '2') {
+      const s2 = results.segment2 || {};
+      return JSON.stringify({
+        scanTime: results.scanTime,
+        segment2: {
+          source:  s2.source,
+          stats:   s2.stats,
+          tier1:   (s2.tier1    || []).slice(0, lim),
+          tier2:   (s2.tier2    || []).slice(0, lim),
+          tier3:   (s2.tier3    || []).slice(0, lim),
+          multiTier: (s2.multiTier || []).slice(0, lim),
+        },
+      }, null, 2);
+    }
+    // Summary for both
+    const s1 = results.segment1 || {};
+    const s2 = results.segment2 || {};
+    return JSON.stringify({
+      scanTime: results.scanTime,
+      segment1: { count: s1.count, topWallets: (s1.wallets || []).slice(0, lim) },
+      segment2: {
+        stats:    s2.stats,
+        tier1:    (s2.tier1    || []).slice(0, lim),
+        tier2:    (s2.tier2    || []).slice(0, lim),
+        tier3:    (s2.tier3    || []).slice(0, lim),
+        multiTier: (s2.multiTier || []).slice(0, lim),
+      },
+    }, null, 2);
   }
   throw new Error(`Unknown tool: ${name}`);
 }
