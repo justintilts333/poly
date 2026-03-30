@@ -556,15 +556,16 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
     const hasPosWin = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
     const redeemTs  = redeemByKey.get(cid);
 
-    // Profitable exit: sold at price > avg buy price (no REDEEM needed)
-    const avgBuyPrice = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
-    const sellPrices  = sellsByMarket ? (sellsByMarket.get(cid) || []) : [];
+    // Exit detection via SELL events: compare sell prices to avg buy price
+    const avgBuyPrice  = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
+    const sellPrices   = sellsByMarket ? (sellsByMarket.get(cid) || []) : [];
     const profitableExit = sellPrices.some(p => p > avgBuyPrice);
+    const lossExit       = sellPrices.length > 0 && Math.max(...sellPrices) < avgBuyPrice;
 
     let isWin  = hasPosWin || !!redeemTs || profitableExit;
-    let isLoss = false;
+    let isLoss = !isWin && lossExit; // sold at a loss and never redeemed → confirmed loss
 
-    if (!isWin) {
+    if (!isWin && !isLoss) {
       // True loss detection: gamma API told us which outcome won for this market.
       // If the wallet's dominant outcomeIndex ≠ winner → confirmed loss.
       const winnerOutcomeIndex = resolvedMarketMap ? resolvedMarketMap.get(cid) : undefined;
