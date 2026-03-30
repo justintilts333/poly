@@ -652,7 +652,7 @@ function assignTiers(m) {
   // Use resolvedCount (not qualifyingCount) for tier thresholds
   const n = m.resolvedCount;
   if (n >= 20 && m.winRate >= 0.70) tiers.push('S');
-  if (n >= 30 && m.winRate >= 0.60) tiers.push(1);
+  if (n >= 25 && m.winRate >= 0.60) tiers.push(1);
   if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
   if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
   return tiers;
@@ -734,9 +734,10 @@ async function runScan() {
       // Build REDEEM info as fallback for positions not in /positions response
       const { redeemByKey, resolvedCids } = buildRedeemInfo(allTrades);
 
-      // STEP 3: qualifying trades
-      const qualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
-      if (!qualifying.length) { skippedNoQualifying++; continue; }
+      // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
+      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
+      if (!allQualifying.length) { skippedNoQualifying++; continue; }
+      const qualifying = allQualifying.slice(0, 30);
 
       // STEP 4: metrics (uses posMap + gamma resolvedMarketMap for true win/loss)
       const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap);
