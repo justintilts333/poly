@@ -246,9 +246,10 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
   const deadlineCutoff  = now + maxDays * 86400000;
   const closedLookback  = now - maxDays * 86400000; // closed in the last maxDays days
 
-  // --- Pass 1: active upcoming markets ---
+  // --- Pass 1: active upcoming markets (hard cap: 60 pages / 30,000 rows) ---
+  const MAX_ACTIVE_PAGES = 60;
   let offset = 0;
-  while (true) {
+  while (offset < MAX_ACTIVE_PAGES * pageSize) {
     try {
       const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${offset}&active=true&closed=false`;
       const data = await fetchJSON(url);
@@ -273,18 +274,19 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
       log(`  Active markets offset=${offset}: ${rows.length} rows, ${added} short-res, total=${conditionIds.size}`);
       if (rows.length < pageSize) break;
       offset += pageSize;
-      await sleep(400);
+      await sleep(200);
     } catch (e) {
       logError('Active markets fetch failed', e);
       break;
     }
   }
 
-  // --- Pass 2: recently-closed markets (resolved within last maxDays days) ---
+  // --- Pass 2: recently-closed markets (hard cap: 20 pages / 10,000 rows) ---
   // These give us TRUE LOSS detection: wallet bought the losing outcome.
+  const MAX_CLOSED_PAGES = 20;
   let closedOffset = 0;
   let closedDone = false;
-  while (!closedDone) {
+  while (!closedDone && closedOffset < MAX_CLOSED_PAGES * pageSize) {
     try {
       const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${closedOffset}&closed=true`;
       const data = await fetchJSON(url);
@@ -297,29 +299,25 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
         if (!endDate) continue;
         const endTs = new Date(endDate).getTime();
 
-        // Stop scanning closed pages once markets are older than our lookback window
         if (endTs < closedLookback) { tooOld++; continue; }
 
         const cid = (m.conditionId || m.condition_id || '').toLowerCase();
         if (!cid) continue;
 
-        // Include in qualifying set so losses on these markets are counted
         conditionIds.add(cid);
         const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
         allMarkets.push({ conditionId: cid, endTs, volume: vol });
         added++;
 
-        // Record which outcome won so we can detect true losses per-wallet
         const winner = parseWinnerOutcomeIndex(m.outcomePrices);
         if (winner !== null) resolvedMarketMap.set(cid, winner);
       }
 
       log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} recent, ${tooOld} old, resolvedMap=${resolvedMarketMap.size}`);
 
-      // Stop if majority of rows are outside our window, or page was not full
       if (tooOld > rows.length * 0.7 || rows.length < pageSize) closedDone = true;
       closedOffset += pageSize;
-      await sleep(400);
+      await sleep(200);
     } catch (e) {
       logError('Closed markets fetch failed', e);
       break;
