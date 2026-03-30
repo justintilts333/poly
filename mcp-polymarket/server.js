@@ -160,12 +160,14 @@ async function callTool(name, args) {
       return JSON.stringify({
         scanTime: results.scanTime,
         segment2: {
-          source:  s2.source,
-          stats:   s2.stats,
-          tier1:   (s2.tier1    || []).slice(0, lim),
-          tier2:   (s2.tier2    || []).slice(0, lim),
-          tier3:   (s2.tier3    || []).slice(0, lim),
-          multiTier: (s2.multiTier || []).slice(0, lim),
+          source:     s2.source,
+          stats:      s2.stats,
+          top5ByPnl:  (s2.top5ByPnl  || []).slice(0, lim),
+          tierS:      (s2.tierS      || []).slice(0, lim),
+          tier1:      (s2.tier1      || []).slice(0, lim),
+          tier2:      (s2.tier2      || []).slice(0, lim),
+          tier3:      (s2.tier3      || []).slice(0, lim),
+          multiTier:  (s2.multiTier  || []).slice(0, lim),
         },
       }, null, 2);
     }
@@ -176,11 +178,13 @@ async function callTool(name, args) {
       scanTime: results.scanTime,
       segment1: { count: s1.count, topWallets: (s1.wallets || []).slice(0, lim) },
       segment2: {
-        stats:    s2.stats,
-        tier1:    (s2.tier1    || []).slice(0, lim),
-        tier2:    (s2.tier2    || []).slice(0, lim),
-        tier3:    (s2.tier3    || []).slice(0, lim),
-        multiTier: (s2.multiTier || []).slice(0, lim),
+        stats:      s2.stats,
+        top5ByPnl:  (s2.top5ByPnl  || []).slice(0, lim),
+        tierS:      (s2.tierS      || []).slice(0, lim),
+        tier1:      (s2.tier1      || []).slice(0, lim),
+        tier2:      (s2.tier2      || []).slice(0, lim),
+        tier3:      (s2.tier3      || []).slice(0, lim),
+        multiTier:  (s2.multiTier  || []).slice(0, lim),
       },
     }, null, 2);
   }
