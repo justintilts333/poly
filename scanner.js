@@ -457,27 +457,34 @@ function getLastTradeTs(allTrades) {
 // resolvedCids:  Set<conditionId> — any conditionId that has ANY redeem
 //                (meaning the market is resolved, whichever side won)
 function buildRedeemInfo(allTrades) {
-  const redeemByKey  = new Map();
+  const redeemByKey  = new Map(); // conditionId → redeemTimestamp
   const resolvedCids = new Set();
+  const sellsByMarket = new Map(); // conditionId → [sellPrice, ...] — for profitable-exit detection
 
   for (const t of allTrades) {
     const tType = (t.type || '').toUpperCase();
-    if (tType !== 'REDEEM' && tType !== 'REDEMPTION') continue;
-
-    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    const cid   = (t.conditionId || t.condition_id || '').toLowerCase();
     if (!cid) continue;
 
-    // outcomeIndex is always 999 in REDEEM events — key by conditionId only
-    let ts = t.timestamp ?? 0;
-    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
-
-    if (!redeemByKey.has(cid) || ts > redeemByKey.get(cid)) {
-      redeemByKey.set(cid, ts || Date.now());
+    if (tType === 'REDEEM' || tType === 'REDEMPTION') {
+      // outcomeIndex is always 999 in REDEEM events — key by conditionId only
+      let ts = t.timestamp ?? 0;
+      if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+      if (!redeemByKey.has(cid) || ts > redeemByKey.get(cid)) {
+        redeemByKey.set(cid, ts || Date.now());
+      }
+      resolvedCids.add(cid);
+    } else if ((t.side || '').toUpperCase() === 'SELL') {
+      // Track all sell prices per market for profitable-exit win detection
+      const price = parseFloat(t.price ?? t.avgPrice ?? 0);
+      if (price > 0) {
+        if (!sellsByMarket.has(cid)) sellsByMarket.set(cid, []);
+        sellsByMarket.get(cid).push(price);
+      }
     }
-    resolvedCids.add(cid);
   }
 
-  return { redeemByKey, resolvedCids };
+  return { redeemByKey, resolvedCids, sellsByMarket };
 }
 
 // ── STEP 3: Qualifying trades filter ──────────────────────────────────────────
@@ -521,7 +528,7 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
 // ── STEP 4: Metrics on qualifying trades (deduplicated per market) ────────────
 // Each conditionId counts as one win or one loss, regardless of how many
 // individual BUY trades the wallet placed on that market.
-function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap) {
+function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket) {
   if (!qualifyingTrades.length) return null;
 
   const now       = Date.now();
@@ -549,7 +556,12 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
     const hasPosWin = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
     const redeemTs  = redeemByKey.get(cid);
 
-    let isWin  = hasPosWin || !!redeemTs;
+    // Profitable exit: sold at price > avg buy price (no REDEEM needed)
+    const avgBuyPrice = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
+    const sellPrices  = sellsByMarket ? (sellsByMarket.get(cid) || []) : [];
+    const profitableExit = sellPrices.some(p => p > avgBuyPrice);
+
+    let isWin  = hasPosWin || !!redeemTs || profitableExit;
     let isLoss = false;
 
     if (!isWin) {
@@ -732,7 +744,7 @@ async function runScan() {
       if (lastTs < cutoff30d) { skippedActivity++; continue; } // explicit 30d check
 
       // Build REDEEM info as fallback for positions not in /positions response
-      const { redeemByKey, resolvedCids } = buildRedeemInfo(allTrades);
+      const { redeemByKey, resolvedCids, sellsByMarket } = buildRedeemInfo(allTrades);
 
       // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
       const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
@@ -740,7 +752,7 @@ async function runScan() {
       const qualifying = allQualifying.slice(0, 30);
 
       // STEP 4: metrics (uses posMap + gamma resolvedMarketMap for true win/loss)
-      const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap);
+      const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket);
       if (!m) { skippedNoResolved++; continue; }
 
       const tiers = assignTiers(m);
