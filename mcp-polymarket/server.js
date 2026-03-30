@@ -133,11 +133,21 @@ async function callTool(name, args) {
     return execSync(`tail -n ${lines} /var/log/polymarket-scanner.log 2>/dev/null || echo "Log not found"`, { encoding: 'utf8' });
   }
   if (name === 'trigger_scan') {
-    // Kill any stale scanner process first
+    const fs = require('fs');
+    const LOCK = '/tmp/polymarket-scanner.lock';
+    // Check if a scanner is already running via lockfile
+    try {
+      const pid = parseInt(fs.readFileSync(LOCK, 'utf8').trim(), 10);
+      if (pid > 0) {
+        try { process.kill(pid, 0); return `Scanner already running (PID ${pid}). Use force=true to restart.`; } catch (_) {}
+      }
+    } catch (_) {}
+    // Remove stale lock and any zombie processes
+    try { fs.unlinkSync(LOCK); } catch (_) {}
     try { require('child_process').execSync("pkill -f 'node.*scanner.js' 2>/dev/null || true"); } catch (_) {}
     const child = spawn('node', ['--max-old-space-size=256', '/opt/polymarket-scanner/scanner.js'], {
       detached: true,
-      stdio: ['ignore', require('fs').openSync('/var/log/polymarket-scanner.log', 'a'), require('fs').openSync('/var/log/polymarket-scanner.log', 'a')],
+      stdio: ['ignore', fs.openSync('/var/log/polymarket-scanner.log', 'a'), fs.openSync('/var/log/polymarket-scanner.log', 'a')],
       env: { ...process.env },
     });
     child.unref();
