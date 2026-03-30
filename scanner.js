@@ -480,6 +480,7 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
   let totalEntryPrice = 0, totalTradeCount = 0;
   let totalPnl = 0;
   let totalReturnMultiple = 0;
+  let totalInvested = 0;
 
   for (const [cid, trades] of byMarket) {
     const posData    = posMap ? posMap.get(cid) : null;
@@ -500,10 +501,11 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
       if (ts > marketTs) marketTs = ts;
     }
 
-    // Accumulate entry price stats across all trades in market
+    // Accumulate entry price and invested capital across all trades in market
     for (const t of trades) {
       const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 0);
       if (!isNaN(price) && price > 0) { totalEntryPrice += price; totalTradeCount++; }
+      totalInvested += parseFloat(t.usdcSize ?? 0);
     }
 
     if (isWin) {
@@ -538,6 +540,7 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
   const avgEntryPrice     = totalTradeCount > 0 ? totalEntryPrice / totalTradeCount : 0;
   const avgReturnMultiple = wins > 0 ? totalReturnMultiple / wins : 0;
   const lastTradeTs       = getLastTradeTs(allTrades);
+  const roi               = totalInvested > 0 ? totalPnl / totalInvested : 0;
 
   return {
     qualifyingCount:  qualifyingTrades.length,
@@ -546,6 +549,8 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
     wins, losses,
     winRate, winRate7d, winRate30d,
     totalPnl,
+    totalInvested,
+    roi,
     avgEntryPrice,
     avgReturnMultiple,
     lastTradeTs,
@@ -568,20 +573,27 @@ function assignTiers(m) {
 }
 
 // ── Score ──────────────────────────────────────────────────────────────────────
+// Bayesian-adjusted win rate × log(sample size) × return bonus + PnL bonus.
+// Prevents small-sample 100% wallets from outranking large-sample 95% wallets.
 function computeScore(m) {
-  const wr7d  = isNaN(m.winRate7d)  ? (isNaN(m.winRate30d) ? m.winRate : m.winRate30d) : m.winRate7d;
-  const wr30d = isNaN(m.winRate30d) ? m.winRate : m.winRate30d;
-  const wrAll = m.winRate;
+  const n = m.resolvedCount;
 
-  const wrScore = (wr7d * 0.5) + (wr30d * 0.3) + (wrAll * 0.2);
+  // Bayesian win rate: prior of 1 win + 1 loss (50% baseline), shrinks extreme WRs
+  const bayesWR = (m.wins + 1) / (n + 2);
 
-  // Price ratio bonus: avg return multiple (entry price vs $1.00 resolution price).
-  // Buying at $0.10 and winning = 10x; cap normalisation at 10x → up to 0.15 bonus.
-  const priceRatioBonus = m.avgReturnMultiple > 0
-    ? Math.min(m.avgReturnMultiple / 10, 1) * 0.15
+  // Sample size weight on log10 scale: 10 markets → 1.0, 100 → 2.0, 1000 → 3.0
+  const sampleWeight = Math.log10(n + 1);
+
+  // Return multiple bonus: (avgReturnMultiple - 1) / 9, capped at 1.0
+  // Buying at $0.10 (10x return) → 1.0 bonus; $0.50 (2x return) → 0.11 bonus
+  const returnBonus = m.avgReturnMultiple > 1
+    ? Math.min((m.avgReturnMultiple - 1) / 9, 1)
     : 0;
 
-  return wrScore + priceRatioBonus;
+  // PnL bonus: soft-capped via tanh; $50k → ~0.10, $500k → ~0.27, $5M → ~0.30
+  const pnlBonus = Math.tanh(Math.max(m.totalPnl, 0) / 100000) * 0.3;
+
+  return parseFloat((bayesWR * sampleWeight * (1 + returnBonus) + pnlBonus).toFixed(4));
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -663,6 +675,8 @@ async function runScan() {
         avgEntryPrice:         m.avgEntryPrice,
         avgReturnMultiple:     m.avgReturnMultiple,
         overallPnl:            m.totalPnl,
+        totalInvested:         m.totalInvested,
+        roi:                   m.roi,
         lastTradeDate:         m.lastTradeDate,
         tiers,
         score,
@@ -689,6 +703,9 @@ async function runScan() {
     .slice(0, 5);
   const sortFn = (a, b) => b.score - a.score;
   [tierS, tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
+
+  // Segment 1: sort Falcon wallets by hScore descending
+  segment1.sort((a, b) => b.hScore - a.hScore);
 
   const results = {
     scanTime: new Date().toISOString(),
