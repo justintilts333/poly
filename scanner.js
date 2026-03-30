@@ -224,14 +224,30 @@ function fetchHeisenbergLeaderboard() {
 }
 
 // ── Short-resolution markets ───────────────────────────────────────────────────
+// Returns outcomePrices index (0=YES, 1=NO) that won, or null if not yet resolved.
+function parseWinnerOutcomeIndex(outcomePrices) {
+  if (!outcomePrices) return null;
+  try {
+    const prices = typeof outcomePrices === 'string' ? JSON.parse(outcomePrices) : outcomePrices;
+    for (let i = 0; i < prices.length; i++) {
+      if (parseFloat(prices[i]) >= 0.99) return i;
+    }
+  } catch (_) {}
+  return null;
+}
+
 async function fetchShortResolutionMarkets(maxDays = 14) {
   log(`Fetching markets resolving within ${maxDays} days...`);
-  const conditionIds = new Set();
-  const allMarkets = [];
-  const pageSize = 500;
-  let offset = 0;
-  const deadlineCutoff = Date.now() + maxDays * 86400000;
+  const conditionIds    = new Set();
+  const resolvedMarketMap = new Map(); // conditionId → winnerOutcomeIndex
+  const allMarkets      = [];
+  const pageSize        = 500;
+  const now             = Date.now();
+  const deadlineCutoff  = now + maxDays * 86400000;
+  const closedLookback  = now - maxDays * 86400000; // closed in the last maxDays days
 
+  // --- Pass 1: active upcoming markets ---
+  let offset = 0;
   while (true) {
     try {
       const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${offset}&active=true&closed=false`;
@@ -244,30 +260,76 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
         const endDate = m.endDate || m.end_date || m.resolutionDate;
         if (!endDate) continue;
         const endTs = new Date(endDate).getTime();
-        if (endTs > Date.now() && endTs <= deadlineCutoff) {
-          const cid = m.conditionId || m.condition_id;
+        if (endTs > now && endTs <= deadlineCutoff) {
+          const cid = (m.conditionId || m.condition_id || '').toLowerCase();
           if (cid) {
-            conditionIds.add(cid.toLowerCase());
+            conditionIds.add(cid);
             const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
-            allMarkets.push({ conditionId: cid.toLowerCase(), endTs, volume: vol });
+            allMarkets.push({ conditionId: cid, endTs, volume: vol });
             added++;
           }
         }
       }
-      log(`  Markets offset=${offset}: ${rows.length} rows, ${added} short-res, total=${conditionIds.size}`);
+      log(`  Active markets offset=${offset}: ${rows.length} rows, ${added} short-res, total=${conditionIds.size}`);
       if (rows.length < pageSize) break;
       offset += pageSize;
       await sleep(400);
     } catch (e) {
-      logError('Markets fetch failed', e);
+      logError('Active markets fetch failed', e);
+      break;
+    }
+  }
+
+  // --- Pass 2: recently-closed markets (resolved within last maxDays days) ---
+  // These give us TRUE LOSS detection: wallet bought the losing outcome.
+  let closedOffset = 0;
+  let closedDone = false;
+  while (!closedDone) {
+    try {
+      const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${closedOffset}&closed=true`;
+      const data = await fetchJSON(url);
+      const rows = Array.isArray(data) ? data : (data.data || data.markets || []);
+      if (!rows.length) break;
+
+      let added = 0, tooOld = 0;
+      for (const m of rows) {
+        const endDate = m.endDate || m.end_date || m.resolutionDate;
+        if (!endDate) continue;
+        const endTs = new Date(endDate).getTime();
+
+        // Stop scanning closed pages once markets are older than our lookback window
+        if (endTs < closedLookback) { tooOld++; continue; }
+
+        const cid = (m.conditionId || m.condition_id || '').toLowerCase();
+        if (!cid) continue;
+
+        // Include in qualifying set so losses on these markets are counted
+        conditionIds.add(cid);
+        const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
+        allMarkets.push({ conditionId: cid, endTs, volume: vol });
+        added++;
+
+        // Record which outcome won so we can detect true losses per-wallet
+        const winner = parseWinnerOutcomeIndex(m.outcomePrices);
+        if (winner !== null) resolvedMarketMap.set(cid, winner);
+      }
+
+      log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} recent, ${tooOld} old, resolvedMap=${resolvedMarketMap.size}`);
+
+      // Stop if majority of rows are outside our window, or page was not full
+      if (tooOld > rows.length * 0.7 || rows.length < pageSize) closedDone = true;
+      closedOffset += pageSize;
+      await sleep(400);
+    } catch (e) {
+      logError('Closed markets fetch failed', e);
       break;
     }
   }
 
   allMarkets.sort((a, b) => b.volume - a.volume);
   const topMarkets = allMarkets.slice(0, 300);
-  log(`Short-resolution markets: ${conditionIds.size} conditionIds (top ${topMarkets.length} by volume)`);
-  return { conditionIds, topMarkets };
+  log(`Markets: ${conditionIds.size} conditionIds (${resolvedMarketMap.size} resolved with known winner, top ${topMarkets.length} by volume)`);
+  return { conditionIds, topMarkets, resolvedMarketMap };
 }
 
 // ── Market holders ─────────────────────────────────────────────────────────────
@@ -459,7 +521,7 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
 // ── STEP 4: Metrics on qualifying trades (deduplicated per market) ────────────
 // Each conditionId counts as one win or one loss, regardless of how many
 // individual BUY trades the wallet placed on that market.
-function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap) {
+function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap) {
   if (!qualifyingTrades.length) return null;
 
   const now       = Date.now();
@@ -483,13 +545,37 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
   let totalInvested = 0;
 
   for (const [cid, trades] of byMarket) {
-    const posData    = posMap ? posMap.get(cid) : null;
-    const hasPosWin  = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
-    const redeemTs   = redeemByKey.get(cid);
-    const isWin      = hasPosWin || !!redeemTs;
-    const marketResolved = resolvedCids.has(cid) ||
-      (posData && (posData.cashPnl !== 0 || posData.realizedPnl !== 0));
-    const isLoss = !isWin && marketResolved;
+    const posData   = posMap ? posMap.get(cid) : null;
+    const hasPosWin = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
+    const redeemTs  = redeemByKey.get(cid);
+
+    let isWin  = hasPosWin || !!redeemTs;
+    let isLoss = false;
+
+    if (!isWin) {
+      // True loss detection: gamma API told us which outcome won for this market.
+      // If the wallet's dominant outcomeIndex ≠ winner → confirmed loss.
+      const winnerOutcomeIndex = resolvedMarketMap ? resolvedMarketMap.get(cid) : undefined;
+      if (winnerOutcomeIndex !== undefined) {
+        // Find the wallet's dominant outcomeIndex across trades in this market
+        const outcomeCounts = {};
+        for (const t of trades) {
+          const oi = t.outcomeIndex ?? 0;
+          outcomeCounts[oi] = (outcomeCounts[oi] || 0) + 1;
+        }
+        const walletOI = parseInt(Object.entries(outcomeCounts).sort((a, b) => b[1] - a[1])[0][0]);
+        if (walletOI === winnerOutcomeIndex) {
+          isWin = true;  // gamma confirms win (REDEEM may be pending)
+        } else {
+          isLoss = true; // CONFIRMED TRUE LOSS — wallet held the losing outcome
+        }
+      } else {
+        // Fallback for markets outside our resolved map: use REDEEM / positions signals
+        const marketResolved = resolvedCids.has(cid) ||
+          (posData && (posData.cashPnl !== 0 || posData.realizedPnl !== 0));
+        isLoss = marketResolved;
+      }
+    }
 
     if (!isWin && !isLoss) continue; // still unresolved — skip
 
@@ -601,7 +687,7 @@ async function runScan() {
   log('=== Polymarket Wallet Scanner v3 (two-segment) ===');
 
   // Segment 1 (Heisenberg) and market data fetched in parallel
-  const [segment1, { conditionIds: shortConditionIds, topMarkets }] = await Promise.all([
+  const [segment1, { conditionIds: shortConditionIds, topMarkets, resolvedMarketMap }] = await Promise.all([
     fetchHeisenbergLeaderboard(),
     fetchShortResolutionMarkets(14),
   ]);
@@ -652,8 +738,8 @@ async function runScan() {
       const qualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
       if (!qualifying.length) { skippedNoQualifying++; continue; }
 
-      // STEP 4: metrics (uses posMap cashPnl/realizedPnl for win detection)
-      const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap);
+      // STEP 4: metrics (uses posMap + gamma resolvedMarketMap for true win/loss)
+      const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap);
       if (!m) { skippedNoResolved++; continue; }
 
       const tiers = assignTiers(m);
