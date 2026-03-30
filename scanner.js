@@ -553,7 +553,7 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
 
   for (const [cid, trades] of byMarket) {
     const posData   = posMap ? posMap.get(cid) : null;
-    const hasPosWin = posData && (posData.cashPnl > 0 || posData.realizedPnl > 0);
+    const hasPosWin = posData && posData.realizedPnl > 0; // realizedPnl only — cashPnl is unrealized (open position)
     const redeemTs  = redeemByKey.get(cid);
 
     // Exit detection via SELL events: compare sell prices to avg buy price
@@ -585,7 +585,7 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
       } else {
         // Fallback for markets outside our resolved map: use REDEEM / positions signals
         const marketResolved = resolvedCids.has(cid) ||
-          (posData && (posData.cashPnl !== 0 || posData.realizedPnl !== 0));
+          (posData && posData.realizedPnl !== 0); // realizedPnl only — cashPnl is unrealized
         isLoss = marketResolved;
       }
     }
