@@ -145,7 +145,7 @@ async function callTool(name, args) {
     // Remove stale lock and any zombie processes
     try { fs.unlinkSync(LOCK); } catch (_) {}
     try { require('child_process').execSync("pkill -f 'node.*scanner.js' 2>/dev/null || true"); } catch (_) {}
-    const child = spawn('node', ['--max-old-space-size=256', '/opt/polymarket-scanner/scanner.js'], {
+    const child = spawn('node', ['--max-old-space-size=768', '/opt/polymarket-scanner/scanner.js'], {
       detached: true,
       stdio: ['ignore', fs.openSync('/var/log/polymarket-scanner.log', 'a'), fs.openSync('/var/log/polymarket-scanner.log', 'a')],
       env: { ...process.env },
