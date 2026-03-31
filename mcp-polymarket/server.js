@@ -135,16 +135,10 @@ async function callTool(name, args) {
   if (name === 'trigger_scan') {
     const fs = require('fs');
     const LOCK = '/tmp/polymarket-scanner.lock';
-    // Check if a scanner is already running via lockfile
-    try {
-      const pid = parseInt(fs.readFileSync(LOCK, 'utf8').trim(), 10);
-      if (pid > 0) {
-        try { process.kill(pid, 0); return `Scanner already running (PID ${pid}). Use force=true to restart.`; } catch (_) {}
-      }
-    } catch (_) {}
-    // Remove stale lock and any zombie processes
-    try { fs.unlinkSync(LOCK); } catch (_) {}
+    // Kill any existing scanner and clear lock
     try { require('child_process').execSync("pkill -f 'node.*scanner.js' 2>/dev/null || true"); } catch (_) {}
+    try { fs.unlinkSync(LOCK); } catch (_) {}
+    await new Promise(r => setTimeout(r, 500)); // let old process die
     const child = spawn('node', ['--max-old-space-size=768', '/opt/polymarket-scanner/scanner.js'], {
       detached: true,
       stdio: ['ignore', fs.openSync('/var/log/polymarket-scanner.log', 'a'), fs.openSync('/var/log/polymarket-scanner.log', 'a')],
