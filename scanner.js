@@ -126,6 +126,8 @@ const GAMMA_API         = 'https://gamma-api.polymarket.com';
 const HEISENBERG_HOST   = 'narrative.agent.heisenberg.so';
 const HEISENBERG_KEY    = process.env.HEISENBERG_API_KEY || '';
 
+const MIN_MARKET_VOLUME = 50_000; // only consider markets with ≥$50k total volume
+
 // ── Heisenberg agent 574 (market outcome lookup) ───────────────────────────────
 const marketOutcomeCache = new Map(); // conditionId → winnerOutcomeIndex (0|1) or undefined
 const h574Stats = { attempts: 0, hits: 0, failures: 0, cacheHits: 0 };
@@ -422,22 +424,22 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
       const rows = Array.isArray(data) ? data : (data.data || data.markets || []);
       if (!rows.length) break;
 
-      let added = 0;
+      let added = 0, tooSmall = 0;
       for (const m of rows) {
         const endDate = m.endDate || m.end_date || m.resolutionDate;
         if (!endDate) continue;
         const endTs = new Date(endDate).getTime();
         if (endTs > now && endTs <= deadlineCutoff) {
           const cid = (m.conditionId || m.condition_id || '').toLowerCase();
-          if (cid) {
-            conditionIds.add(cid);
-            const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
-            allMarkets.push({ conditionId: cid, endTs, volume: vol });
-            added++;
-          }
+          if (!cid) continue;
+          const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
+          if (vol < MIN_MARKET_VOLUME) { tooSmall++; continue; }
+          conditionIds.add(cid);
+          allMarkets.push({ conditionId: cid, endTs, volume: vol });
+          added++;
         }
       }
-      log(`  Active markets offset=${offset}: ${rows.length} rows, ${added} short-res, total=${conditionIds.size}`);
+      log(`  Active markets offset=${offset}: ${rows.length} rows, ${added} qualifying (≥$${(MIN_MARKET_VOLUME/1000).toFixed(0)}k), ${tooSmall} too small, total=${conditionIds.size}`);
       if (rows.length < pageSize) break;
       offset += pageSize;
       await sleep(200);
@@ -459,7 +461,7 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
       const rows = Array.isArray(data) ? data : (data.data || data.markets || []);
       if (!rows.length) break;
 
-      let added = 0, tooOld = 0;
+      let added = 0, tooOld = 0, tooSmall = 0;
       for (const m of rows) {
         const endDate = m.endDate || m.end_date || m.resolutionDate;
         if (!endDate) continue;
@@ -470,8 +472,10 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
         const cid = (m.conditionId || m.condition_id || '').toLowerCase();
         if (!cid) continue;
 
-        conditionIds.add(cid);
         const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
+        if (vol < MIN_MARKET_VOLUME) { tooSmall++; continue; }
+
+        conditionIds.add(cid);
         allMarkets.push({ conditionId: cid, endTs, volume: vol });
         added++;
 
@@ -479,7 +483,7 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
         if (winner !== null) resolvedMarketMap.set(cid, winner);
       }
 
-      log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} recent, ${tooOld} old, resolvedMap=${resolvedMarketMap.size}`);
+      log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} qualifying, ${tooOld} old, ${tooSmall} too small, resolvedMap=${resolvedMarketMap.size}`);
 
       if (tooOld > rows.length * 0.7 || rows.length < pageSize) closedDone = true;
       closedOffset += pageSize;
