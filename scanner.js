@@ -5,9 +5,10 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const LOG_FILE = '/var/log/polymarket-scanner.log';
-const DATA_FILE = path.join(__dirname, 'data', 'results.json');
-const LOCK_FILE = '/tmp/polymarket-scanner.lock';
+const LOG_FILE       = '/var/log/polymarket-scanner.log';
+const DATA_FILE      = path.join(__dirname, 'data', 'results.json');
+const LOCK_FILE      = '/tmp/polymarket-scanner.lock';
+const CHECKPOINT_FILE = path.join(__dirname, 'data', 'checkpoint.json');
 
 // ── Single-instance lock ───────────────────────────────────────────────────────
 function acquireLock() {
@@ -827,41 +828,103 @@ function computeScore(m) {
   return parseFloat((bayesWR * sampleWeight * (1 + returnBonus) + pnlBonus).toFixed(4));
 }
 
+// ── Checkpoint helpers ─────────────────────────────────────────────────────────
+function saveCheckpoint(data) {
+  const tmp = CHECKPOINT_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, CHECKPOINT_FILE);
+  } catch (e) { logError('Failed to save checkpoint', e); }
+}
+
+function loadCheckpoint() {
+  try { return JSON.parse(fs.readFileSync(CHECKPOINT_FILE, 'utf8')); }
+  catch (_) { return null; }
+}
+
+function clearCheckpoint() {
+  try { fs.unlinkSync(CHECKPOINT_FILE); } catch (_) {}
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 async function runScan() {
   log('=== Polymarket Wallet Scanner v3 (two-segment) ===');
 
-  // Segment 1 (Heisenberg agent 584) and market data fetched in parallel.
-  // Agent 574 session opens AFTER agent 584 closes — Heisenberg allows one SSE session per key.
-  const [segment1, { conditionIds: shortConditionIds, topMarkets, resolvedMarketMap }] = await Promise.all([
-    fetchHeisenbergLeaderboard(),
-    fetchShortResolutionMarkets(14),
-  ]);
+  // ── Resume from checkpoint if available ──────────────────────────────────────
+  const ckpt = loadCheckpoint();
+  let segment1, shortConditionIds, resolvedMarketMap, allWallets, startIndex;
+  let tierS, tier1, tier2, tier3, seen;
+  let processed, skippedBot, skippedActivity, skippedNoTrades,
+      skippedNoQualifying, skippedNoResolved, skippedNoTier;
+
+  if (ckpt) {
+    log(`Resuming from checkpoint: wallet ${ckpt.startIndex}/${ckpt.wallets.length} (${ckpt.wallets.length - ckpt.startIndex} remaining)`);
+    segment1          = ckpt.segment1;
+    shortConditionIds = new Set(ckpt.shortConditionIds);
+    resolvedMarketMap = new Map(ckpt.resolvedMarketMap);
+    allWallets        = ckpt.wallets;
+    startIndex        = ckpt.startIndex;
+    tierS             = ckpt.tierS;
+    tier1             = ckpt.tier1;
+    tier2             = ckpt.tier2;
+    tier3             = ckpt.tier3;
+    seen              = new Map(ckpt.seen);
+    ({ processed, skippedBot, skippedActivity, skippedNoTrades,
+       skippedNoQualifying, skippedNoResolved, skippedNoTier } = ckpt.stats);
+    // Restore agent 574 cache
+    for (const [k, v] of (ckpt.marketOutcomeCache || [])) marketOutcomeCache.set(k, v);
+  } else {
+    // ── Full setup ─────────────────────────────────────────────────────────────
+    // Segment 1 (Heisenberg agent 584) and market data fetched in parallel.
+    // Agent 574 session opens AFTER agent 584 closes — one SSE session per key.
+    const [seg1, markets] = await Promise.all([
+      fetchHeisenbergLeaderboard(),
+      fetchShortResolutionMarkets(14),
+    ]);
+    segment1          = seg1;
+    shortConditionIds = markets.conditionIds;
+    resolvedMarketMap = markets.resolvedMarketMap;
+
+    const holderWallets = await fetchMarketHolders(markets.topMarkets);
+    allWallets  = [...holderWallets];
+    startIndex  = 0;
+    tierS = []; tier1 = []; tier2 = []; tier3 = [];
+    seen  = new Map();
+    processed = 0; skippedBot = 0; skippedActivity = 0; skippedNoTrades = 0;
+    skippedNoQualifying = 0; skippedNoResolved = 0; skippedNoTier = 0;
+    log(`Segment 2 candidates: ${allWallets.length} (market holders)`);
+  }
+
+  // Open agent 574 session (always fresh — SSE sessions don't survive restarts)
   const h574Session = await openHeisenbergSession();
   if (!h574Session) {
     log('WARNING: agent 574 session unavailable — true loss detection DISABLED (win rates may be inflated)');
   }
 
-  const holderWallets = await fetchMarketHolders(topMarkets);
-
-  // Segment 2 candidates: market holders only
-  const allWallets = [...holderWallets];
-  log(`Segment 2 candidates: ${allWallets.length} (market holders)`);
-
-  const tierS = [], tier1 = [], tier2 = [], tier3 = [];
-  const seen  = new Map();
-  let processed = 0;
-  let skippedBot = 0, skippedActivity = 0, skippedNoTrades = 0,
-      skippedNoQualifying = 0, skippedNoResolved = 0, skippedNoTier = 0;
-
   const now       = Date.now();
   const cutoff7d  = now - 7  * 86400000;
   const cutoff30d = now - 30 * 86400000;
 
-  for (const address of allWallets) {
+  for (let i = startIndex; i < allWallets.length; i++) {
+    const address = allWallets[i];
     processed++;
     if (processed % 50 === 0) {
       log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} | bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
+    }
+
+    // Save checkpoint every 200 wallets
+    if (processed % 200 === 0) {
+      saveCheckpoint({
+        startIndex:        i + 1,
+        wallets:           allWallets,
+        segment1,
+        shortConditionIds: [...shortConditionIds],
+        resolvedMarketMap: [...resolvedMarketMap],
+        tierS, tier1, tier2, tier3,
+        seen:              [...seen],
+        stats:             { processed, skippedBot, skippedActivity, skippedNoTrades, skippedNoQualifying, skippedNoResolved, skippedNoTier },
+        marketOutcomeCache: [...marketOutcomeCache],
+      });
     }
 
     try {
@@ -932,7 +995,9 @@ async function runScan() {
     }
 
     await sleep(250);
-  }
+  } // end wallet loop
+
+  clearCheckpoint();
 
   // Close agent 574 session and log stats
   if (h574Session) {
