@@ -108,6 +108,154 @@ const GAMMA_API         = 'https://gamma-api.polymarket.com';
 const HEISENBERG_HOST   = 'narrative.agent.heisenberg.so';
 const HEISENBERG_KEY    = process.env.HEISENBERG_API_KEY || '';
 
+// ── Heisenberg agent 574 (market outcome lookup) ───────────────────────────────
+const marketOutcomeCache = new Map(); // conditionId → winnerOutcomeIndex (0|1) or undefined
+const h574Stats = { attempts: 0, hits: 0, failures: 0, cacheHits: 0 };
+
+// Opens a persistent SSE session to Heisenberg. Returns { call, close } or null on failure.
+function openHeisenbergSession() {
+  return new Promise((resolve) => {
+    if (!HEISENBERG_KEY) {
+      log('WARNING: HEISENBERG_API_KEY not set — agent 574 win/loss detection DISABLED');
+      return resolve(null);
+    }
+
+    let sessionPath = null;
+    const pending = new Map();
+    let msgId = 0;
+    let settled = false;
+
+    function sendMsg(body) {
+      return new Promise((res, rej) => {
+        const payload = JSON.stringify(body);
+        const r = https.request({
+          hostname: HEISENBERG_HOST, path: sessionPath, method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${HEISENBERG_KEY}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+          timeout: 15000,
+        }, (response) => { response.resume(); });
+        r.on('error', rej);
+        r.write(payload); r.end();
+        if (body.id != null) {
+          pending.set(body.id, res);
+          setTimeout(() => {
+            if (pending.has(body.id)) { pending.delete(body.id); rej(new Error(`h574 timeout id=${body.id}`)); }
+          }, 45000);
+        } else { res(null); }
+      });
+    }
+
+    async function runHandshake(sseReq) {
+      await sendMsg({ jsonrpc: '2.0', id: ++msgId, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'scanner', version: '1.0' } } });
+      await sendMsg({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
+      await sendMsg({ jsonrpc: '2.0', id: ++msgId, method: 'tools/call', params: { name: 'authenticate', arguments: { token: HEISENBERG_KEY } } });
+      log('Heisenberg session (agent 574) ready — true win/loss detection enabled');
+      settled = true;
+      resolve({
+        call: async (agentId, params) => {
+          const id = ++msgId;
+          return sendMsg({
+            jsonrpc: '2.0', id, method: 'tools/call',
+            params: {
+              name: 'perform_parameterized_retrieval',
+              arguments: { token: HEISENBERG_KEY, agent_id: agentId, params, formatter_config: { format_type: 'raw' } },
+            },
+          });
+        },
+        close: () => { try { sseReq.destroy(); } catch (_) {} },
+      });
+    }
+
+    const req = https.get({
+      hostname: HEISENBERG_HOST, path: '/sse',
+      headers: { 'Authorization': `Bearer ${HEISENBERG_KEY}`, 'Accept': 'text/event-stream' },
+      timeout: 60000,
+    }, (res) => {
+      let buf = '', eventType = '';
+      res.on('data', chunk => {
+        buf += chunk.toString();
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          if (line.startsWith('event:')) { eventType = line.slice(6).trim(); }
+          else if (line.startsWith('data:')) {
+            const data = line.slice(5).trim();
+            if (eventType === 'endpoint' || data.startsWith('/messages')) {
+              sessionPath = data;
+              runHandshake(req).catch(err => {
+                logError('WARNING: Heisenberg session handshake failed — agent 574 DISABLED', err);
+                if (!settled) { settled = true; req.destroy(); resolve(null); }
+              });
+            } else {
+              try {
+                const msg = JSON.parse(data);
+                if (msg.id != null && pending.has(msg.id)) {
+                  const cb = pending.get(msg.id); pending.delete(msg.id); cb(msg);
+                }
+              } catch (_) {}
+            }
+            eventType = '';
+          }
+        }
+      });
+      res.on('error', err => {
+        logError('WARNING: Heisenberg SSE stream error — agent 574 DISABLED', err);
+        if (!settled) { settled = true; resolve(null); }
+      });
+    });
+    req.on('error', err => {
+      logError('WARNING: Heisenberg connect error — agent 574 DISABLED', err);
+      if (!settled) { settled = true; resolve(null); }
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      logError('WARNING: Heisenberg SSE timeout — agent 574 DISABLED', null);
+      if (!settled) { settled = true; resolve(null); }
+    });
+  });
+}
+
+// Look up which outcome won for a given conditionId via agent 574.
+// Returns winnerOutcomeIndex (0|1) or undefined (unresolved / API failure).
+async function lookupMarketOutcome(cid, session) {
+  if (marketOutcomeCache.has(cid)) { h574Stats.cacheHits++; return marketOutcomeCache.get(cid); }
+  if (!session) return undefined;
+
+  h574Stats.attempts++;
+  try {
+    const r = await session.call(574, { condition_id: cid });
+    const text = r?.result?.content?.[0]?.text || '';
+    const parsed = JSON.parse(text);
+    const rows = parsed?.data?.results || (Array.isArray(parsed) ? parsed : [parsed]);
+    const row = rows[0];
+    if (!row) { marketOutcomeCache.set(cid, undefined); h574Stats.failures++; return undefined; }
+
+    const winningOutcome = (row.winning_outcome || '').toLowerCase();
+    if (!winningOutcome) { marketOutcomeCache.set(cid, undefined); return undefined; }
+
+    // Map winning_outcome string to outcomeIndex using side labels when available
+    const sideA = (row.side_a_outcome || row.outcome_a || '').toLowerCase();
+    const sideB = (row.side_b_outcome || row.outcome_b || '').toLowerCase();
+    let winnerIndex;
+    if (sideA && winningOutcome === sideA) winnerIndex = 0;
+    else if (sideB && winningOutcome === sideB) winnerIndex = 1;
+    else if (winningOutcome === 'yes') winnerIndex = 0;
+    else if (winningOutcome === 'no') winnerIndex = 1;
+    else { marketOutcomeCache.set(cid, undefined); return undefined; }
+
+    h574Stats.hits++;
+    marketOutcomeCache.set(cid, winnerIndex);
+    return winnerIndex;
+  } catch (err) {
+    logError(`agent 574 lookup failed for ${cid}`, err);
+    h574Stats.failures++;
+    marketOutcomeCache.set(cid, undefined); // cache failure to avoid retrying same cid
+    return undefined;
+  }
+}
+
 // ── Segment 1: Heisenberg Falcon leaderboard (agent 584) ──────────────────────
 function fetchHeisenbergLeaderboard() {
   return new Promise((resolve) => {
@@ -491,9 +639,7 @@ function buildRedeemInfo(allTrades) {
 //   b) market is "short-resolution" — either:
 //      i.  conditionId is in our upcoming <14d set (will resolve soon), OR
 //      ii. there is a REDEEM within 14 days of the BUY (already resolved quickly)
-function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
-  const maxResolutionMs = 14 * 86400000;
-
+function filterQualifyingTrades(allTrades, shortConditionIds) {
   return allTrades.filter(t => {
     // Must be a BUY
     const tType = (t.type || '').toUpperCase();
@@ -505,28 +651,16 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
     const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
     if (isNaN(price) || price >= 0.50) return false;
 
+    // Market must be in our short-resolution set (resolves within 14 days)
     const cid = (t.conditionId || t.condition_id || '').toLowerCase();
-    const key = `${cid}:${t.outcomeIndex ?? ''}`;
-
-    // Short-resolution check
-    let buyTs = t.timestamp ?? 0;
-    if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
-
-    const inUpcomingShortMarket = shortConditionIds.size > 0 && shortConditionIds.has(cid);
-
-    const redeemTs = redeemByKey.get(cid);
-    const resolvedQuickly = redeemTs &&
-      (redeemTs - buyTs) >= 0 &&
-      (redeemTs - buyTs) <= maxResolutionMs;
-
-    return inUpcomingShortMarket || resolvedQuickly;
+    return shortConditionIds.size > 0 && shortConditionIds.has(cid);
   });
 }
 
 // ── STEP 4: Metrics on qualifying trades (deduplicated per market) ────────────
 // Each conditionId counts as one win or one loss, regardless of how many
 // individual BUY trades the wallet placed on that market.
-function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket) {
+async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket, h574Session) {
   if (!qualifyingTrades.length) return null;
 
   const now       = Date.now();
@@ -564,26 +698,26 @@ function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, pos
     let isLoss = !isWin && lossExit; // sold at a loss and never redeemed → confirmed loss
 
     if (!isWin && !isLoss) {
-      // True loss detection: gamma API told us which outcome won for this market.
-      // If the wallet's dominant outcomeIndex ≠ winner → confirmed loss.
-      const winnerOutcomeIndex = resolvedMarketMap ? resolvedMarketMap.get(cid) : undefined;
+      // Try gamma resolvedMarketMap first (no API call, fast)
+      const gammaWinner = resolvedMarketMap ? resolvedMarketMap.get(cid) : undefined;
+      const winnerOutcomeIndex = gammaWinner !== undefined
+        ? gammaWinner
+        : await lookupMarketOutcome(cid, h574Session); // agent 574 fallback
+
       if (winnerOutcomeIndex !== undefined) {
-        // Find the wallet's dominant outcomeIndex across trades in this market
+        // Find the wallet's dominant outcomeIndex across qualifying trades in this market
         const outcomeCounts = {};
         for (const t of trades) {
           const oi = t.outcomeIndex ?? 0;
           outcomeCounts[oi] = (outcomeCounts[oi] || 0) + 1;
         }
         const walletOI = parseInt(Object.entries(outcomeCounts).sort((a, b) => b[1] - a[1])[0][0]);
-        if (walletOI === winnerOutcomeIndex) {
-          isWin = true;  // gamma confirms win (REDEEM may be pending)
-        } else {
-          isLoss = true; // CONFIRMED TRUE LOSS — wallet held the losing outcome
-        }
+        if (walletOI === winnerOutcomeIndex) isWin = true;
+        else isLoss = true;
       } else {
-        // Fallback for markets outside our resolved map: use REDEEM / positions signals
+        // No resolution data available — last resort: positions/redeem signals
         const marketResolved = resolvedCids.has(cid) ||
-          (posData && posData.realizedPnl !== 0); // realizedPnl only — cashPnl is unrealized
+          (posData && posData.realizedPnl !== 0);
         isLoss = marketResolved;
       }
     }
@@ -697,11 +831,15 @@ function computeScore(m) {
 async function runScan() {
   log('=== Polymarket Wallet Scanner v3 (two-segment) ===');
 
-  // Segment 1 (Heisenberg) and market data fetched in parallel
-  const [segment1, { conditionIds: shortConditionIds, topMarkets, resolvedMarketMap }] = await Promise.all([
+  // Segment 1 (Heisenberg), market data, and agent 574 session opened in parallel
+  const [segment1, { conditionIds: shortConditionIds, topMarkets, resolvedMarketMap }, h574Session] = await Promise.all([
     fetchHeisenbergLeaderboard(),
     fetchShortResolutionMarkets(14),
+    openHeisenbergSession(),
   ]);
+  if (!h574Session) {
+    log('WARNING: agent 574 session unavailable — true loss detection DISABLED (win rates may be inflated)');
+  }
 
   const holderWallets = await fetchMarketHolders(topMarkets);
 
@@ -746,12 +884,12 @@ async function runScan() {
       const { redeemByKey, resolvedCids, sellsByMarket } = buildRedeemInfo(allTrades);
 
       // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
-      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
+      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds);
       if (!allQualifying.length) { skippedNoQualifying++; continue; }
       const qualifying = allQualifying.slice(0, 30);
 
-      // STEP 4: metrics (uses posMap + gamma resolvedMarketMap for true win/loss)
-      const m = calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket);
+      // STEP 4: metrics (uses posMap + gamma resolvedMarketMap + agent 574 for true win/loss)
+      const m = await calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket, h574Session);
       if (!m) { skippedNoResolved++; continue; }
 
       const tiers = assignTiers(m);
@@ -793,6 +931,17 @@ async function runScan() {
     }
 
     await sleep(250);
+  }
+
+  // Close agent 574 session and log stats
+  if (h574Session) {
+    try { h574Session.close(); } catch (_) {}
+  }
+  const h574Total = h574Stats.attempts;
+  const h574FailRate = h574Total > 0 ? (h574Stats.failures / h574Total * 100).toFixed(1) : '0.0';
+  log(`Agent 574 stats: attempts=${h574Total} hits=${h574Stats.hits} failures=${h574Stats.failures} cacheHits=${h574Stats.cacheHits} (${h574FailRate}% failure rate)`);
+  if (h574Total > 0 && h574Stats.failures / h574Total > 0.10) {
+    log(`WARNING: agent 574 failure rate ${h574FailRate}% exceeds 10% — win/loss detection may be inaccurate`);
   }
 
   const multiTier = [...seen.values()].filter(w => w.tiers.length >= 2);
