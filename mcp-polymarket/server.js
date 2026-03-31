@@ -2,8 +2,22 @@
 
 const https   = require('https');
 const http    = require('http');
+const fs      = require('fs');
 const express = require('express');
 const { execSync, spawn } = require('child_process');
+
+// ── Load HEISENBERG_API_KEY from .env.sh if not in environment ─────────────────
+(function loadEnvFile() {
+  if (process.env.HEISENBERG_API_KEY) return;
+  try {
+    const envSh = fs.readFileSync('/opt/polymarket-scanner/.env.sh', 'utf8');
+    const match = envSh.match(/HEISENBERG_API_KEY="([^"]+)"/);
+    if (match && match[1]) {
+      process.env.HEISENBERG_API_KEY = match[1];
+      console.log('Loaded HEISENBERG_API_KEY from .env.sh');
+    }
+  } catch (_) {}
+})();
 
 const PORT = process.env.MCP_PORT || 3001;
 

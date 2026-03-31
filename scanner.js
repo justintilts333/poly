@@ -103,6 +103,23 @@ function fetchJSON(url, retries = 3, delayMs = 2000) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ── Load env vars from .env.sh if not already set ─────────────────────────────
+(function loadEnvFile() {
+  if (process.env.HEISENBERG_API_KEY) return;
+  try {
+    const envSh = fs.readFileSync(path.join(__dirname, '.env.sh'), 'utf8');
+    const match = envSh.match(/HEISENBERG_API_KEY="([^"]+)"/);
+    if (match && match[1]) {
+      process.env.HEISENBERG_API_KEY = match[1];
+      log('Loaded HEISENBERG_API_KEY from .env.sh');
+    } else {
+      log('WARNING: HEISENBERG_API_KEY not found in .env.sh');
+    }
+  } catch (e) {
+    log(`WARNING: Could not read .env.sh — ${e.message}`);
+  }
+})();
+
 // ── API base URLs ──────────────────────────────────────────────────────────────
 const DATA_API          = 'https://data-api.polymarket.com';
 const GAMMA_API         = 'https://gamma-api.polymarket.com';
