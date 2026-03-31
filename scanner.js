@@ -831,12 +831,13 @@ function computeScore(m) {
 async function runScan() {
   log('=== Polymarket Wallet Scanner v3 (two-segment) ===');
 
-  // Segment 1 (Heisenberg), market data, and agent 574 session opened in parallel
-  const [segment1, { conditionIds: shortConditionIds, topMarkets, resolvedMarketMap }, h574Session] = await Promise.all([
+  // Segment 1 (Heisenberg agent 584) and market data fetched in parallel.
+  // Agent 574 session opens AFTER agent 584 closes — Heisenberg allows one SSE session per key.
+  const [segment1, { conditionIds: shortConditionIds, topMarkets, resolvedMarketMap }] = await Promise.all([
     fetchHeisenbergLeaderboard(),
     fetchShortResolutionMarkets(14),
-    openHeisenbergSession(),
   ]);
+  const h574Session = await openHeisenbergSession();
   if (!h574Session) {
     log('WARNING: agent 574 session unavailable — true loss detection DISABLED (win rates may be inflated)');
   }
