@@ -525,46 +525,31 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
 // Paginate ALL buyers from qualifying markets. Return every unique wallet for
 // full evaluation — no prescore cut, no good wallets filtered prematurely.
 async function fetchMarketTraders(topMarkets) {
-  log(`Paginating all buyers from ${topMarkets.length} markets...`);
+  log(`Collecting holders from ${topMarkets.length} markets...`);
   const wallets = new Set();
   const PAGE = 500;
 
   for (let i = 0; i < topMarkets.length; i++) {
     const { conditionId } = topMarkets[i];
-    let offset = 0;
-
-    while (true) {
-      let rows = [];
-      try {
-        const url = `${DATA_API}/activity?market=${conditionId}&limit=${PAGE}&offset=${offset}`;
-        const data = await fetchJSON(url, 2, 1000);
-        rows = Array.isArray(data) ? data : (data.data || data.activity || []);
-      } catch (_) {
-        break; // skip market on error, no holders fallback (holders don't have price/side)
+    try {
+      const url = `${DATA_API}/holders?market=${conditionId}&limit=${PAGE}`;
+      const data = await fetchJSON(url, 2, 1000);
+      const groups = Array.isArray(data) ? data : [];
+      for (const g of groups) {
+        for (const h of (g.holders || [])) {
+          const addr = (h.proxyWallet || h.proxy_wallet || '').toLowerCase();
+          if (addr) wallets.add(addr);
+        }
       }
-
-      if (!rows.length) break;
-
-      for (const t of rows) {
-        const side  = (t.side || t.type || '').toUpperCase();
-        const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
-        if (side !== 'BUY' || isNaN(price) || price >= 0.50) continue;
-        const addr = (t.proxyWallet || t.proxy_wallet || t.user || t.maker || '').toLowerCase();
-        if (addr) wallets.add(addr);
-      }
-
-      if (rows.length < PAGE) break;
-      offset += PAGE;
-      await sleep(120);
-    }
+    } catch (_) {}
 
     if ((i + 1) % 50 === 0) {
-      log(`  Buyer scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets`);
+      log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets`);
     }
     await sleep(120);
   }
 
-  log(`Buyer scan complete: ${wallets.size} unique wallets with at least one BUY <$0.50`);
+  log(`Holder scan complete: ${wallets.size} unique wallets`);
   return wallets;
 }
 
