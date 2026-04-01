@@ -130,7 +130,8 @@ const MIN_MARKET_VOLUME = 50_000; // only consider markets with ≥$50k total vo
 
 // ── Heisenberg agent 574 (market outcome lookup) ───────────────────────────────
 const marketOutcomeCache = new Map(); // conditionId → winnerOutcomeIndex (0|1) or undefined
-const h574Stats = { attempts: 0, hits: 0, failures: 0, cacheHits: 0 };
+const h574Stats = { attempts: 0, hits: 0, failures: 0, cacheHits: 0, reconnects: 0 };
+let h574SessionRef = null; // module-level so lookupMarketOutcome can reconnect
 
 // Opens a persistent SSE session to Heisenberg. Returns { call, close } or null on failure.
 function openHeisenbergSession() {
@@ -239,40 +240,60 @@ function openHeisenbergSession() {
 
 // Look up which outcome won for a given conditionId via agent 574.
 // Returns winnerOutcomeIndex (0|1) or undefined (unresolved / API failure).
-async function lookupMarketOutcome(cid, session) {
+// Uses module-level h574SessionRef and auto-reconnects on failure.
+async function lookupMarketOutcome(cid) {
   if (marketOutcomeCache.has(cid)) { h574Stats.cacheHits++; return marketOutcomeCache.get(cid); }
-  if (!session) return undefined;
+  if (!h574SessionRef) return undefined;
 
   h574Stats.attempts++;
-  try {
-    const r = await session.call(574, { condition_id: cid });
+
+  async function doCall() {
+    const r = await h574SessionRef.call(574, { condition_id: cid });
     const text = r?.result?.content?.[0]?.text || '';
     const parsed = JSON.parse(text);
     const rows = parsed?.data?.results || (Array.isArray(parsed) ? parsed : [parsed]);
     const row = rows[0];
-    if (!row) { marketOutcomeCache.set(cid, undefined); h574Stats.failures++; return undefined; }
+    if (!row) return undefined;
 
     const winningOutcome = (row.winning_outcome || '').toLowerCase();
-    if (!winningOutcome) { marketOutcomeCache.set(cid, undefined); return undefined; }
+    if (!winningOutcome) return undefined;
 
-    // Map winning_outcome string to outcomeIndex using side labels when available
     const sideA = (row.side_a_outcome || row.outcome_a || '').toLowerCase();
     const sideB = (row.side_b_outcome || row.outcome_b || '').toLowerCase();
-    let winnerIndex;
-    if (sideA && winningOutcome === sideA) winnerIndex = 0;
-    else if (sideB && winningOutcome === sideB) winnerIndex = 1;
-    else if (winningOutcome === 'yes') winnerIndex = 0;
-    else if (winningOutcome === 'no') winnerIndex = 1;
-    else { marketOutcomeCache.set(cid, undefined); return undefined; }
-
-    h574Stats.hits++;
-    marketOutcomeCache.set(cid, winnerIndex);
-    return winnerIndex;
-  } catch (err) {
-    logError(`agent 574 lookup failed for ${cid}`, err);
-    h574Stats.failures++;
-    marketOutcomeCache.set(cid, undefined); // cache failure to avoid retrying same cid
+    if (sideA && winningOutcome === sideA) return 0;
+    if (sideB && winningOutcome === sideB) return 1;
+    if (winningOutcome === 'yes') return 0;
+    if (winningOutcome === 'no') return 1;
     return undefined;
+  }
+
+  try {
+    const result = await doCall();
+    if (result !== undefined) h574Stats.hits++;
+    marketOutcomeCache.set(cid, result);
+    return result;
+  } catch (err) {
+    // Attempt one reconnect before giving up
+    logError(`agent 574 call failed — reconnecting`, err);
+    try { h574SessionRef.close(); } catch (_) {}
+    h574SessionRef = await openHeisenbergSession();
+    h574Stats.reconnects++;
+    if (!h574SessionRef) {
+      h574Stats.failures++;
+      marketOutcomeCache.set(cid, undefined);
+      return undefined;
+    }
+    try {
+      const result = await doCall();
+      if (result !== undefined) h574Stats.hits++;
+      marketOutcomeCache.set(cid, result);
+      return result;
+    } catch (err2) {
+      logError(`agent 574 retry failed for ${cid}`, err2);
+      h574Stats.failures++;
+      marketOutcomeCache.set(cid, undefined);
+      return undefined;
+    }
   }
 }
 
@@ -500,32 +521,46 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
   return { conditionIds, topMarkets, resolvedMarketMap };
 }
 
-// ── Market holders ─────────────────────────────────────────────────────────────
-async function fetchMarketHolders(topMarkets) {
-  log(`Fetching holders from top ${topMarkets.length} markets...`);
+// ── Market traders (recent buyers) ────────────────────────────────────────────
+// Sources wallets from actual BUY activity in qualifying markets, not just holders.
+// This ensures candidates have placed trades in these markets (reducing noQual).
+async function fetchMarketTraders(topMarkets) {
+  log(`Fetching recent traders from top ${topMarkets.length} markets...`);
   const wallets = new Set();
 
   for (let i = 0; i < topMarkets.length; i++) {
     const { conditionId } = topMarkets[i];
     try {
-      const url = `${DATA_API}/holders?market=${conditionId}&limit=100`;
+      // Activity endpoint by market — returns recent trades for this market
+      const url = `${DATA_API}/activity?market=${conditionId}&limit=500`;
       const data = await fetchJSON(url, 2, 1000);
-      const groups = Array.isArray(data) ? data : [];
-      for (const group of groups) {
-        for (const h of (group.holders || [])) {
-          if (h.proxyWallet) wallets.add(h.proxyWallet.toLowerCase());
-        }
+      const rows = Array.isArray(data) ? data : (data.data || data.activity || []);
+      for (const t of rows) {
+        const wallet = t.proxyWallet || t.proxy_wallet || t.user || t.maker;
+        if (wallet) wallets.add(wallet.toLowerCase());
       }
     } catch (e) {
-      if (i === 0) logError(`Holders fetch (market ${conditionId})`, e);
+      // Fallback: holders endpoint if activity endpoint unavailable
+      try {
+        const url = `${DATA_API}/holders?market=${conditionId}&limit=100`;
+        const data = await fetchJSON(url, 2, 1000);
+        const groups = Array.isArray(data) ? data : [];
+        for (const group of groups) {
+          for (const h of (group.holders || [])) {
+            if (h.proxyWallet) wallets.add(h.proxyWallet.toLowerCase());
+          }
+        }
+      } catch (e2) {
+        if (i === 0) logError(`Traders fetch (market ${conditionId})`, e2);
+      }
     }
     if ((i + 1) % 50 === 0) {
-      log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} wallets`);
+      log(`  Trader scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} wallets`);
     }
     await sleep(150);
   }
 
-  log(`Market holder scan: ${wallets.size} wallets`);
+  log(`Market trader scan: ${wallets.size} wallets`);
   return wallets;
 }
 
@@ -682,7 +717,7 @@ function filterQualifyingTrades(allTrades, shortConditionIds) {
 // ── STEP 4: Metrics on qualifying trades (deduplicated per market) ────────────
 // Each conditionId counts as one win or one loss, regardless of how many
 // individual BUY trades the wallet placed on that market.
-async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket, h574Session) {
+async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket) {
   if (!qualifyingTrades.length) return null;
 
   const now       = Date.now();
@@ -724,7 +759,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
       const gammaWinner = resolvedMarketMap ? resolvedMarketMap.get(cid) : undefined;
       const winnerOutcomeIndex = gammaWinner !== undefined
         ? gammaWinner
-        : await lookupMarketOutcome(cid, h574Session); // agent 574 fallback
+        : await lookupMarketOutcome(cid); // agent 574 fallback (auto-reconnects)
 
       if (winnerOutcomeIndex !== undefined) {
         // Find the wallet's dominant outcomeIndex across qualifying trades in this market
@@ -822,6 +857,7 @@ function assignTiers(m) {
   if (n >= 25 && m.winRate >= 0.60) tiers.push(1);
   if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
   if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
+  if (n >= 10 && m.winRate >= 0.50) tiers.push(4);
   return tiers;
 }
 
@@ -874,7 +910,7 @@ async function runScan() {
   // ── Resume from checkpoint if available ──────────────────────────────────────
   const ckpt = loadCheckpoint();
   let segment1, shortConditionIds, resolvedMarketMap, allWallets, startIndex;
-  let tierS, tier1, tier2, tier3, seen;
+  let tierS, tier1, tier2, tier3, tier4, seen;
   let processed, skippedBot, skippedActivity, skippedNoTrades,
       skippedNoQualifying, skippedNoResolved, skippedNoTier;
 
@@ -889,6 +925,7 @@ async function runScan() {
     tier1             = ckpt.tier1;
     tier2             = ckpt.tier2;
     tier3             = ckpt.tier3;
+    tier4             = ckpt.tier4 || [];
     seen              = new Map(ckpt.seen);
     ({ processed, skippedBot, skippedActivity, skippedNoTrades,
        skippedNoQualifying, skippedNoResolved, skippedNoTier } = ckpt.stats);
@@ -906,19 +943,19 @@ async function runScan() {
     shortConditionIds = markets.conditionIds;
     resolvedMarketMap = markets.resolvedMarketMap;
 
-    const holderWallets = await fetchMarketHolders(markets.topMarkets);
+    const holderWallets = await fetchMarketTraders(markets.topMarkets);
     allWallets  = [...holderWallets];
     startIndex  = 0;
-    tierS = []; tier1 = []; tier2 = []; tier3 = [];
+    tierS = []; tier1 = []; tier2 = []; tier3 = []; tier4 = [];
     seen  = new Map();
     processed = 0; skippedBot = 0; skippedActivity = 0; skippedNoTrades = 0;
     skippedNoQualifying = 0; skippedNoResolved = 0; skippedNoTier = 0;
     log(`Segment 2 candidates: ${allWallets.length} (market holders)`);
   }
 
-  // Open agent 574 session (always fresh — SSE sessions don't survive restarts)
-  const h574Session = await openHeisenbergSession();
-  if (!h574Session) {
+  // Open agent 574 session — stored in module-level ref so lookupMarketOutcome can reconnect
+  h574SessionRef = await openHeisenbergSession();
+  if (!h574SessionRef) {
     log('WARNING: agent 574 session unavailable — true loss detection DISABLED (win rates may be inflated)');
   }
 
@@ -930,7 +967,7 @@ async function runScan() {
     const address = allWallets[i];
     processed++;
     if (processed % 50 === 0) {
-      log(`Progress: ${processed}/${allWallets.length} | T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} | bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
+      log(`Progress: ${processed}/${allWallets.length} | S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} | bot=${skippedBot} inactive=${skippedActivity} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
     }
 
     // Save checkpoint every 200 wallets
@@ -941,7 +978,7 @@ async function runScan() {
         segment1,
         shortConditionIds: [...shortConditionIds],
         resolvedMarketMap: [...resolvedMarketMap],
-        tierS, tier1, tier2, tier3,
+        tierS, tier1, tier2, tier3, tier4,
         seen:              [...seen],
         stats:             { processed, skippedBot, skippedActivity, skippedNoTrades, skippedNoQualifying, skippedNoResolved, skippedNoTier },
         marketOutcomeCache: [...marketOutcomeCache],
@@ -974,7 +1011,7 @@ async function runScan() {
       const qualifying = allQualifying.slice(0, 30);
 
       // STEP 4: metrics (uses posMap + gamma resolvedMarketMap + agent 574 for true win/loss)
-      const m = await calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket, h574Session);
+      const m = await calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket);
       if (!m) { skippedNoResolved++; continue; }
 
       const tiers = assignTiers(m);
@@ -1010,6 +1047,7 @@ async function runScan() {
       if (tiers.includes(1))   tier1.push(record);
       if (tiers.includes(2))   tier2.push(record);
       if (tiers.includes(3))   tier3.push(record);
+      if (tiers.includes(4))   tier4.push(record);
 
     } catch (e) {
       logError(`Evaluate ${address}`, e);
@@ -1021,12 +1059,13 @@ async function runScan() {
   clearCheckpoint();
 
   // Close agent 574 session and log stats
-  if (h574Session) {
-    try { h574Session.close(); } catch (_) {}
+  if (h574SessionRef) {
+    try { h574SessionRef.close(); } catch (_) {}
+    h574SessionRef = null;
   }
   const h574Total = h574Stats.attempts;
   const h574FailRate = h574Total > 0 ? (h574Stats.failures / h574Total * 100).toFixed(1) : '0.0';
-  log(`Agent 574 stats: attempts=${h574Total} hits=${h574Stats.hits} failures=${h574Stats.failures} cacheHits=${h574Stats.cacheHits} (${h574FailRate}% failure rate)`);
+  log(`Agent 574 stats: attempts=${h574Total} hits=${h574Stats.hits} failures=${h574Stats.failures} reconnects=${h574Stats.reconnects} cacheHits=${h574Stats.cacheHits} (${h574FailRate}% failure rate)`);
   if (h574Total > 0 && h574Stats.failures / h574Total > 0.10) {
     log(`WARNING: agent 574 failure rate ${h574FailRate}% exceeds 10% — win/loss detection may be inaccurate`);
   }
@@ -1036,7 +1075,7 @@ async function runScan() {
     .sort((a, b) => b.overallPnl - a.overallPnl)
     .slice(0, 5);
   const sortFn = (a, b) => b.score - a.score;
-  [tierS, tier1, tier2, tier3, multiTier].forEach(a => a.sort(sortFn));
+  [tierS, tier1, tier2, tier3, tier4, multiTier].forEach(a => a.sort(sortFn));
 
   // Segment 1: sort Falcon wallets by hScore descending
   segment1.sort((a, b) => b.hScore - a.hScore);
@@ -1051,7 +1090,7 @@ async function runScan() {
     segment2: {
       source:      'Market holders — own criteria (BUY <$0.50, 14d resolution window)',
       top5ByPnl,
-      tierS, tier1, tier2, tier3, multiTier,
+      tierS, tier1, tier2, tier3, tier4, multiTier,
       stats: {
         candidates:          allWallets.length,
         processed,
@@ -1065,6 +1104,7 @@ async function runScan() {
         tier1Count:     tier1.length,
         tier2Count:     tier2.length,
         tier3Count:     tier3.length,
+        tier4Count:     tier4.length,
         multiTierCount: multiTier.length,
       },
     },
@@ -1076,7 +1116,7 @@ async function runScan() {
 
   log(`=== Scan complete ===`);
   log(`  Segment 1 (Falcon): ${segment1.length} wallets`);
-  log(`  Segment 2 (own criteria): S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} Multi=${multiTier.length}`);
+  log(`  Segment 2 (own criteria): S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} Multi=${multiTier.length}`);
   log(`  Segment 2 skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
   return results;
 }
