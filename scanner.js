@@ -521,20 +521,17 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
   return { conditionIds, topMarkets, resolvedMarketMap };
 }
 
-// ── Market traders — prescore pipeline ────────────────────────────────────────
-// Phase 1: paginate ALL buyers from qualifying markets, tracking position size.
-// Phase 2: fetch lightweight trade count per unique wallet.
-// Phase 3: score by log(totalInvested) × 0.6 + log(tradeCount) × 0.4, return top 500.
+// ── Market traders — paginate all buyers ──────────────────────────────────────
+// Paginate ALL buyers from qualifying markets. Return every unique wallet for
+// full evaluation — no prescore cut, no good wallets filtered prematurely.
 async function fetchMarketTraders(topMarkets) {
-  // ── Phase 1: collect all buyers + their invested USDC across qualifying markets ──
-  log(`Phase 1: paginating all buyers from ${topMarkets.length} markets...`);
-  const walletStats = new Map(); // address → { totalInvested, appearances }
+  log(`Paginating all buyers from ${topMarkets.length} markets...`);
+  const wallets = new Set();
   const PAGE = 500;
 
   for (let i = 0; i < topMarkets.length; i++) {
     const { conditionId } = topMarkets[i];
     let offset = 0;
-    let pagesThisMarket = 0;
 
     while (true) {
       let rows = [];
@@ -543,7 +540,7 @@ async function fetchMarketTraders(topMarkets) {
         const data = await fetchJSON(url, 2, 1000);
         rows = Array.isArray(data) ? data : (data.data || data.activity || []);
       } catch (_) {
-        // fallback: holders endpoint (no pagination, no USDC data)
+        // fallback: holders endpoint
         try {
           const url = `${DATA_API}/holders?market=${conditionId}&limit=${PAGE}`;
           const hData = await fetchJSON(url, 2, 1000);
@@ -551,10 +548,7 @@ async function fetchMarketTraders(topMarkets) {
           for (const g of groups) {
             for (const h of (g.holders || [])) {
               const addr = (h.proxyWallet || '').toLowerCase();
-              if (!addr) continue;
-              const s = walletStats.get(addr) || { totalInvested: 0, appearances: 0 };
-              s.appearances++;
-              walletStats.set(addr, s);
+              if (addr) wallets.add(addr);
             }
           }
         } catch (_2) {}
@@ -565,69 +559,22 @@ async function fetchMarketTraders(topMarkets) {
 
       for (const t of rows) {
         const addr = (t.proxyWallet || t.proxy_wallet || t.user || t.maker || '').toLowerCase();
-        if (!addr) continue;
-        const usdc = parseFloat(t.usdcSize || t.usdc_size || 0);
-        const s = walletStats.get(addr) || { totalInvested: 0, appearances: 0 };
-        s.totalInvested += usdc;
-        s.appearances++;
-        walletStats.set(addr, s);
+        if (addr) wallets.add(addr);
       }
 
-      pagesThisMarket++;
-      if (rows.length < PAGE) break; // last page
+      if (rows.length < PAGE) break;
       offset += PAGE;
       await sleep(120);
     }
 
     if ((i + 1) % 50 === 0) {
-      log(`  Phase 1: ${i + 1}/${topMarkets.length} markets, ${walletStats.size} unique wallets`);
+      log(`  Buyer scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets`);
     }
     await sleep(120);
   }
 
-  log(`Phase 1 complete: ${walletStats.size} unique wallets found across qualifying markets`);
-
-  // ── Phase 2: lightweight trade count per wallet ────────────────────────────────
-  log(`Phase 2: fetching trade counts for ${walletStats.size} wallets...`);
-  let fetched = 0;
-  for (const [address, stats] of walletStats) {
-    try {
-      const url = `${DATA_API}/activity?user=${address}&limit=100&sortBy=TIMESTAMP&ascending=false`;
-      const data = await fetchJSON(url, 1, 1000);
-      const rows = Array.isArray(data) ? data : (data.data || data.activity || []);
-      stats.polymarketTrades = rows.length; // 0–100; 100 means likely 100+
-    } catch (_) {
-      stats.polymarketTrades = 0;
-    }
-    fetched++;
-    if (fetched % 1000 === 0) {
-      log(`  Phase 2: ${fetched}/${walletStats.size} wallets`);
-    }
-    await sleep(120);
-  }
-
-  // ── Phase 3: score and select top 500 ─────────────────────────────────────────
-  // log-scale both signals so neither dominates: a $10k bet and 500 trades both matter
-  const scored = [...walletStats.entries()].map(([address, s]) => ({
-    address,
-    prescoreInvested: Math.log1p(s.totalInvested),
-    prescoreTrades:   Math.log1p(s.polymarketTrades),
-    prescore: Math.log1p(s.totalInvested) * 0.6 + Math.log1p(s.polymarketTrades) * 0.4,
-    totalInvested: s.totalInvested,
-    polymarketTrades: s.polymarketTrades,
-  }));
-
-  scored.sort((a, b) => b.prescore - a.prescore);
-  const top500 = scored.slice(0, 500);
-
-  const top = top500[0];
-  const bot = top500[top500.length - 1];
-  log(`Phase 3 complete: top 500 selected`);
-  log(`  Score range: ${bot?.prescore.toFixed(3)} – ${top?.prescore.toFixed(3)}`);
-  log(`  Invested range: $${bot?.totalInvested.toFixed(0)} – $${top?.totalInvested.toFixed(0)}`);
-  log(`  Trade count range: ${bot?.polymarketTrades} – ${top?.polymarketTrades}`);
-
-  return new Set(top500.map(w => w.address));
+  log(`Buyer scan complete: ${wallets.size} unique wallets — all will be evaluated`);
+  return wallets;
 }
 
 // ── Wallet positions (cashPnl / realizedPnl) ──────────────────────────────────
