@@ -540,24 +540,15 @@ async function fetchMarketTraders(topMarkets) {
         const data = await fetchJSON(url, 2, 1000);
         rows = Array.isArray(data) ? data : (data.data || data.activity || []);
       } catch (_) {
-        // fallback: holders endpoint
-        try {
-          const url = `${DATA_API}/holders?market=${conditionId}&limit=${PAGE}`;
-          const hData = await fetchJSON(url, 2, 1000);
-          const groups = Array.isArray(hData) ? hData : [];
-          for (const g of groups) {
-            for (const h of (g.holders || [])) {
-              const addr = (h.proxyWallet || '').toLowerCase();
-              if (addr) wallets.add(addr);
-            }
-          }
-        } catch (_2) {}
-        break;
+        break; // skip market on error, no holders fallback (holders don't have price/side)
       }
 
       if (!rows.length) break;
 
       for (const t of rows) {
+        const side  = (t.side || t.type || '').toUpperCase();
+        const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
+        if (side !== 'BUY' || isNaN(price) || price >= 0.50) continue;
         const addr = (t.proxyWallet || t.proxy_wallet || t.user || t.maker || '').toLowerCase();
         if (addr) wallets.add(addr);
       }
@@ -573,7 +564,7 @@ async function fetchMarketTraders(topMarkets) {
     await sleep(120);
   }
 
-  log(`Buyer scan complete: ${wallets.size} unique wallets — all will be evaluated`);
+  log(`Buyer scan complete: ${wallets.size} unique wallets with at least one BUY <$0.50`);
   return wallets;
 }
 
