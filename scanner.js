@@ -525,31 +525,57 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
 // Paginate ALL buyers from qualifying markets. Return every unique wallet for
 // full evaluation — no prescore cut, no good wallets filtered prematurely.
 async function fetchMarketTraders(topMarkets) {
-  log(`Collecting holders from ${topMarkets.length} markets...`);
+  const useH556 = !!h574SessionRef;
+  log(`Collecting underdog buyers from ${topMarkets.length} markets via ${useH556 ? 'agent 556' : 'holders fallback'}...`);
   const wallets = new Set();
-  const PAGE = 500;
 
   for (let i = 0; i < topMarkets.length; i++) {
     const { conditionId } = topMarkets[i];
-    try {
-      const url = `${DATA_API}/holders?market=${conditionId}&limit=${PAGE}`;
-      const data = await fetchJSON(url, 2, 1000);
-      const groups = Array.isArray(data) ? data : [];
-      for (const g of groups) {
-        for (const h of (g.holders || [])) {
-          const addr = (h.proxyWallet || h.proxy_wallet || '').toLowerCase();
-          if (addr) wallets.add(addr);
+
+    if (useH556) {
+      // Agent 556: paginate BUY trades for this market, filter price < 0.50
+      let offset = 0;
+      while (true) {
+        try {
+          const r = await h574SessionRef.call(556, { condition_id: conditionId, side: 'BUY', offset, limit: 200 });
+          const text = r?.result?.content?.[0]?.text || '{}';
+          const parsed = JSON.parse(text);
+          const rows = parsed?.data?.results || [];
+          for (const t of rows) {
+            if (parseFloat(t.price) < 0.50) {
+              const addr = (t.proxy_wallet || t.proxyWallet || '').toLowerCase();
+              if (addr) wallets.add(addr);
+            }
+          }
+          if (!parsed?.pagination?.has_more) break;
+          offset += 200;
+          await sleep(100);
+        } catch (_) {
+          break;
         }
       }
-    } catch (_) {}
+    } else {
+      // Fallback: holders endpoint (no price filter, broader pool)
+      try {
+        const url = `${DATA_API}/holders?market=${conditionId}&limit=500`;
+        const data = await fetchJSON(url, 2, 1000);
+        const groups = Array.isArray(data) ? data : [];
+        for (const g of groups) {
+          for (const h of (g.holders || [])) {
+            const addr = (h.proxyWallet || h.proxy_wallet || '').toLowerCase();
+            if (addr) wallets.add(addr);
+          }
+        }
+      } catch (_) {}
+      await sleep(120);
+    }
 
     if ((i + 1) % 50 === 0) {
-      log(`  Holder scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets`);
+      log(`  Buyer scan: ${i + 1}/${topMarkets.length} markets, ${wallets.size} unique wallets`);
     }
-    await sleep(120);
   }
 
-  log(`Holder scan complete: ${wallets.size} unique wallets`);
+  log(`Buyer scan complete: ${wallets.size} unique wallets${useH556 ? ' (confirmed BUY <$0.50)' : ' (holders fallback)'}`);
   return wallets;
 }
 
@@ -932,6 +958,13 @@ async function runScan() {
     shortConditionIds = markets.conditionIds;
     resolvedMarketMap = markets.resolvedMarketMap;
 
+    // Open Heisenberg session after leaderboard (agent 584) closes its session.
+    // Same session is used for agent 556 (wallet sourcing) and agent 574 (win detection).
+    h574SessionRef = await openHeisenbergSession();
+    if (!h574SessionRef) {
+      log('WARNING: Heisenberg session unavailable — using holders fallback for wallet sourcing, win detection DISABLED');
+    }
+
     const holderWallets = await fetchMarketTraders(markets.topMarkets);
     allWallets  = [...holderWallets];
     startIndex  = 0;
@@ -940,12 +973,6 @@ async function runScan() {
     processed = 0; skippedBot = 0; skippedActivity = 0; skippedNoTrades = 0;
     skippedNoQualifying = 0; skippedNoResolved = 0; skippedNoTier = 0;
     log(`Segment 2 candidates: ${allWallets.length} (prescored market traders)`);
-  }
-
-  // Open agent 574 session — stored in module-level ref so lookupMarketOutcome can reconnect
-  h574SessionRef = await openHeisenbergSession();
-  if (!h574SessionRef) {
-    log('WARNING: agent 574 session unavailable — true loss detection DISABLED (win rates may be inflated)');
   }
 
   const now       = Date.now();
