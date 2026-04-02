@@ -758,8 +758,12 @@ function buildRedeemInfo(allTrades) {
       // Track all sell prices per market for profitable-exit win detection
       const price = parseFloat(t.price ?? t.avgPrice ?? 0);
       if (price > 0) {
-        if (!sellsByMarket.has(cid)) sellsByMarket.set(cid, []);
-        sellsByMarket.get(cid).push(price);
+        if (!sellsByMarket.has(cid)) sellsByMarket.set(cid, { prices: [], earliestTs: 0 });
+        const entry = sellsByMarket.get(cid);
+        entry.prices.push(price);
+        let ts = t.timestamp ?? 0;
+        if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+        if (ts > 0 && (entry.earliestTs === 0 || ts < entry.earliestTs)) entry.earliestTs = ts;
       }
     }
   }
@@ -770,10 +774,38 @@ function buildRedeemInfo(allTrades) {
 // ── STEP 3: Qualifying trades filter ──────────────────────────────────────────
 // Keep BUY trades where:
 //   a) price < $0.50
-//   b) market is "short-resolution" — either:
-//      i.  conditionId is in our upcoming <14d set (will resolve soon), OR
-//      ii. there is a REDEEM within 14 days of the BUY (already resolved quickly)
-function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
+//   b) market is "short-resolution" — any of:
+//      i.   conditionId is in our upcoming <14d set (will resolve soon)
+//      ii.  there is a REDEEM within 14 days of the BUY (already resolved — wallet won)
+//      iii. wallet sold below their buy price within 14 days (already resolved — wallet lost)
+//      iv.  gamma confirmed resolved AND endDate within 14 days of the BUY
+//
+// Paths ii and iii are symmetric: ii catches wins, iii catches losses.
+// Without iii, loss-exit markets are invisible and win rates are inflated.
+function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sellsByMarket) {
+  // Build per-conditionId: { avgBuyPrice, firstBuyTs } for loss-exit check
+  const buysByMarket = new Map();
+  for (const t of allTrades) {
+    const tType = (t.type || '').toUpperCase();
+    const side  = (t.side  || '').toUpperCase();
+    if (side !== 'BUY' && tType !== 'BUY') continue;
+    if (tType === 'REDEEM' || tType === 'SELL' || tType === 'MERGE') continue;
+    const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
+    if (isNaN(price) || price >= 0.50) continue;
+    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    if (!cid) continue;
+    let ts = t.timestamp ?? 0;
+    if (typeof ts === 'string') ts = new Date(ts).getTime() || 0;
+    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+    const existing = buysByMarket.get(cid);
+    if (!existing) {
+      buysByMarket.set(cid, { prices: [price], firstBuyTs: ts });
+    } else {
+      existing.prices.push(price);
+      if (ts > 0 && (existing.firstBuyTs === 0 || ts < existing.firstBuyTs)) existing.firstBuyTs = ts;
+    }
+  }
+
   return allTrades.filter(t => {
     // Must be a BUY
     const tType = (t.type || '').toUpperCase();
@@ -790,25 +822,40 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
     // Primary: in our pre-fetched short-resolution market set
     if (shortConditionIds.size > 0 && shortConditionIds.has(cid)) return true;
 
-    // Secondary: wallet has a REDEEM for this conditionId within 14 days of the BUY
-    // (confirms the market was short-resolution and already resolved — wallet won)
+    let buyTs = t.timestamp ?? 0;
+    if (typeof buyTs === 'string') buyTs = new Date(buyTs).getTime() || 0;
+    if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
+
+    // Secondary: wallet has a REDEEM within 14 days of the BUY (win path)
     if (redeemByKey && redeemByKey.has(cid)) {
-      let buyTs = t.timestamp ?? 0;
-      if (typeof buyTs === 'string') buyTs = new Date(buyTs).getTime() || 0;
-      if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
       const redeemTs = redeemByKey.get(cid);
       if (buyTs > 0 && redeemTs > buyTs && redeemTs - buyTs <= 14 * 86400000) return true;
     }
 
-    // Tertiary: gamma confirmed this market resolved AND it was short-resolution
-    // (endDate within 14 days of the buy). This symmetrically catches silent losses
-    // where wallet held losing position to zero — no REDEEM, no sell.
+    // Tertiary (loss-exit): wallet sold this market below their avg buy price within 14 days.
+    // This is the symmetric loss path to the REDEEM win path above.
+    // A sell below buy price confirms the market resolved against the wallet (or they cut losses).
+    if (sellsByMarket && sellsByMarket.has(cid)) {
+      const mktBuys = buysByMarket.get(cid);
+      const sellEntry = sellsByMarket.get(cid);
+      if (mktBuys && sellEntry) {
+        const avgBuy  = mktBuys.prices.reduce((a, b) => a + b, 0) / mktBuys.prices.length;
+        const prices  = sellEntry.prices || sellEntry;
+        const maxSell = Math.max(...prices);
+        // Sell clearly below avg buy price (not just tiny noise) = confirmed loss exit
+        if (maxSell < avgBuy * 0.75) {
+          // Check: sell occurred within 14 days of first buy (confirms short-resolution)
+          const firstBuyTs  = mktBuys.firstBuyTs || buyTs;
+          const earliestSellTs = sellEntry.earliestTs || 0;
+          if (firstBuyTs > 0 && earliestSellTs > 0 && earliestSellTs - firstBuyTs <= 14 * 86400000) return true;
+        }
+      }
+    }
+
+    // Quaternary: gamma confirmed this market resolved AND it was short-resolution
     if (gammaOutcomeCache.has(cid) && gammaOutcomeCache.get(cid) !== undefined) {
       const endTs = gammaMeta.get(cid);
       if (endTs) {
-        let buyTs = t.timestamp ?? 0;
-        if (typeof buyTs === 'string') buyTs = new Date(buyTs).getTime() || 0;
-        if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
         if (buyTs > 0 && endTs - buyTs <= 14 * 86400000 && endTs >= buyTs) return true;
       }
     }
@@ -850,7 +897,8 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
 
     // Exit detection via SELL events: compare sell prices to avg buy price
     const avgBuyPrice  = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
-    const sellPrices   = sellsByMarket ? (sellsByMarket.get(cid) || []) : [];
+    const sellEntry    = sellsByMarket ? sellsByMarket.get(cid) : null;
+    const sellPrices   = sellEntry ? (sellEntry.prices || sellEntry) : []; // support old and new shape
     const profitableExit = sellPrices.some(p => p > avgBuyPrice);
     const lossExit       = sellPrices.length > 0 && Math.max(...sellPrices) < avgBuyPrice;
 
@@ -1120,7 +1168,7 @@ async function runScan() {
       await prefetchGammaOutcomes(allTrades, shortConditionIds, redeemByKey);
 
       // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
-      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
+      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sellsByMarket);
       if (!allQualifying.length) { skippedNoQualifying++; continue; }
       const qualifying = allQualifying.slice(0, 30);
 
