@@ -131,6 +131,10 @@ const MIN_MARKET_VOLUME = 50_000; // only consider markets with ≥$50k total vo
 // ── Heisenberg agent 574 (market outcome lookup) ───────────────────────────────
 const marketOutcomeCache = new Map(); // conditionId → winnerOutcomeIndex (0|1) or undefined
 const h574Stats = { attempts: 0, hits: 0, failures: 0, cacheHits: 0, reconnects: 0 };
+
+// ── Direct gamma outcome cache (final fallback for loss detection) ─────────────
+const gammaOutcomeCache = new Map(); // conditionId → winnerOutcomeIndex (0|1) or undefined
+const gammaOutcomeStats = { fetches: 0, cacheHits: 0, resolved: 0 };
 let h574SessionRef = null; // module-level so lookupMarketOutcome can reconnect
 
 // Opens a persistent SSE session to Heisenberg. Returns { call, close } or null on failure.
@@ -294,6 +298,28 @@ async function lookupMarketOutcome(cid) {
       marketOutcomeCache.set(cid, undefined);
       return undefined;
     }
+  }
+}
+
+// ── Direct gamma API outcome lookup (final fallback, cached) ──────────────────
+// Fetches a single market by conditionId and extracts the winning outcomeIndex
+// from outcomePrices. Returns 0|1 if resolved, undefined if unresolved/error.
+// Results are cached at module level so each conditionId is fetched at most once.
+async function fetchGammaMarketOutcome(cid) {
+  if (gammaOutcomeCache.has(cid)) { gammaOutcomeStats.cacheHits++; return gammaOutcomeCache.get(cid); }
+  gammaOutcomeStats.fetches++;
+  try {
+    const data = await fetchJSON(`${GAMMA_API}/markets?conditionId=${cid}&limit=1`, 1, 500);
+    const markets = Array.isArray(data) ? data : (data.data || data.markets || []);
+    if (!markets.length) { gammaOutcomeCache.set(cid, undefined); return undefined; }
+    const winner = parseWinnerOutcomeIndex(markets[0].outcomePrices);
+    const result = winner !== null ? winner : undefined;
+    gammaOutcomeCache.set(cid, result);
+    if (result !== undefined) gammaOutcomeStats.resolved++;
+    return result;
+  } catch (_) {
+    gammaOutcomeCache.set(cid, undefined);
+    return undefined;
   }
 }
 
@@ -791,9 +817,15 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     if (!isWin && !isLoss) {
       // Try gamma resolvedMarketMap first (no API call, fast)
       const gammaWinner = resolvedMarketMap ? resolvedMarketMap.get(cid) : undefined;
-      const winnerOutcomeIndex = gammaWinner !== undefined
+      let winnerOutcomeIndex = gammaWinner !== undefined
         ? gammaWinner
         : await lookupMarketOutcome(cid); // agent 574 fallback (auto-reconnects)
+      // Final fallback: direct gamma API fetch — catches losses where wallet held
+      // losing position to zero without selling or REDEEMing (silent losses).
+      // Cached per conditionId so each market is only fetched once per scan.
+      if (winnerOutcomeIndex === undefined) {
+        winnerOutcomeIndex = await fetchGammaMarketOutcome(cid);
+      }
 
       if (winnerOutcomeIndex !== undefined) {
         // Find the wallet's dominant outcomeIndex across qualifying trades in this market
@@ -1101,6 +1133,7 @@ async function runScan() {
   const h574Total = h574Stats.attempts;
   const h574FailRate = h574Total > 0 ? (h574Stats.failures / h574Total * 100).toFixed(1) : '0.0';
   log(`Agent 574 stats: attempts=${h574Total} hits=${h574Stats.hits} failures=${h574Stats.failures} reconnects=${h574Stats.reconnects} cacheHits=${h574Stats.cacheHits} (${h574FailRate}% failure rate)`);
+  log(`Gamma outcome cache: ${gammaOutcomeStats.fetches} fetches, ${gammaOutcomeStats.cacheHits} cache hits, ${gammaOutcomeStats.resolved} resolved`);
   if (h574Total > 0 && h574Stats.failures / h574Total > 0.10) {
     log(`WARNING: agent 574 failure rate ${h574FailRate}% exceeds 10% — win/loss detection may be inaccurate`);
   }
