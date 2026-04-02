@@ -302,9 +302,11 @@ async function lookupMarketOutcome(cid) {
 }
 
 // ── Direct gamma API outcome lookup (final fallback, cached) ──────────────────
-// Fetches a single market by conditionId and extracts the winning outcomeIndex
-// from outcomePrices. Returns 0|1 if resolved, undefined if unresolved/error.
-// Results are cached at module level so each conditionId is fetched at most once.
+// Fetches a single market by conditionId, stores the winning outcomeIndex AND
+// the endDate so callers can check if it was a short-resolution market.
+// Returns 0|1 if resolved, undefined if unresolved/error.
+const gammaMeta = new Map(); // conditionId → { endTs, winner }
+
 async function fetchGammaMarketOutcome(cid) {
   if (gammaOutcomeCache.has(cid)) { gammaOutcomeStats.cacheHits++; return gammaOutcomeCache.get(cid); }
   gammaOutcomeStats.fetches++;
@@ -312,14 +314,42 @@ async function fetchGammaMarketOutcome(cid) {
     const data = await fetchJSON(`${GAMMA_API}/markets?conditionId=${cid}&limit=1`, 1, 500);
     const markets = Array.isArray(data) ? data : (data.data || data.markets || []);
     if (!markets.length) { gammaOutcomeCache.set(cid, undefined); return undefined; }
-    const winner = parseWinnerOutcomeIndex(markets[0].outcomePrices);
+    const m = markets[0];
+    const winner = parseWinnerOutcomeIndex(m.outcomePrices);
     const result = winner !== null ? winner : undefined;
     gammaOutcomeCache.set(cid, result);
+    const endDate = m.endDate || m.end_date || m.resolutionDate;
+    if (endDate) gammaMeta.set(cid, new Date(endDate).getTime());
     if (result !== undefined) gammaOutcomeStats.resolved++;
     return result;
   } catch (_) {
     gammaOutcomeCache.set(cid, undefined);
     return undefined;
+  }
+}
+
+// Pre-fetch gamma outcomes for all BUY < $0.50 conditionIds not already
+// covered by shortConditionIds or REDEEM signals. This symmetrically captures
+// silent losses (wallet held losing position to zero) from recently-closed
+// short-resolution markets, preventing inflated win rates.
+async function prefetchGammaOutcomes(allTrades, shortConditionIds, redeemByKey) {
+  const toFetch = new Set();
+  for (const t of allTrades) {
+    const tType = (t.type || '').toUpperCase();
+    const side  = (t.side  || '').toUpperCase();
+    if (side !== 'BUY' && tType !== 'BUY') continue;
+    if (tType === 'REDEEM' || tType === 'SELL' || tType === 'MERGE') continue;
+    const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
+    if (isNaN(price) || price >= 0.50) continue;
+    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    if (!cid || shortConditionIds.has(cid) || gammaOutcomeCache.has(cid)) continue;
+    if (redeemByKey && redeemByKey.has(cid)) continue;
+    toFetch.add(cid);
+  }
+  // Fetch in batches of 5 to balance speed vs rate limiting
+  const cids = [...toFetch];
+  for (let i = 0; i < cids.length; i += 5) {
+    await Promise.all(cids.slice(i, i + 5).map(cid => fetchGammaMarketOutcome(cid)));
   }
 }
 
@@ -770,6 +800,19 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
       if (buyTs > 0 && redeemTs > buyTs && redeemTs - buyTs <= 14 * 86400000) return true;
     }
 
+    // Tertiary: gamma confirmed this market resolved AND it was short-resolution
+    // (endDate within 14 days of the buy). This symmetrically catches silent losses
+    // where wallet held losing position to zero — no REDEEM, no sell.
+    if (gammaOutcomeCache.has(cid) && gammaOutcomeCache.get(cid) !== undefined) {
+      const endTs = gammaMeta.get(cid);
+      if (endTs) {
+        let buyTs = t.timestamp ?? 0;
+        if (typeof buyTs === 'string') buyTs = new Date(buyTs).getTime() || 0;
+        if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
+        if (buyTs > 0 && endTs - buyTs <= 14 * 86400000 && endTs >= buyTs) return true;
+      }
+    }
+
     return false;
   });
 }
@@ -1071,6 +1114,10 @@ async function runScan() {
 
       // Build REDEEM info as fallback for positions not in /positions response
       const { redeemByKey, resolvedCids, sellsByMarket } = buildRedeemInfo(allTrades);
+
+      // Pre-fetch gamma outcomes for all BUY < $0.50 conditionIds not in
+      // shortConditionIds or REDEEM set — catches silent losses in closed markets
+      await prefetchGammaOutcomes(allTrades, shortConditionIds, redeemByKey);
 
       // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
       const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
