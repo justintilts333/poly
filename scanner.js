@@ -902,6 +902,8 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   let totalEntryPrice = 0, totalTradeCount = 0;
   let totalPnl = 0;
   let pnl30d = 0;
+  let pnlWins30d = 0;   // gross profit from 30d wins (for profit-factor criterion)
+  let pnlLosses30d = 0; // gross loss from 30d losses (absolute value)
   let invested30d = 0;
   let totalReturnMultiple = 0;
   let totalInvested = 0;
@@ -948,16 +950,29 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
         else isLoss = true;
       } else {
         // No resolution data from any source.
-        // Only skip if we can positively confirm the market is still open (endTs in future).
-        // Otherwise: no profit signal (no REDEEM, no positive PnL) = loss.
-        // Treating "unknown" as "open" would systematically exclude potential losses and
-        // inflate win rates — the wallet would only look bad when wins self-report via REDEEM.
+        // Determine open vs expired using two sources:
+        //   1. gammaMeta end date (pre-populated from bulk scan or lazy fetch)
+        //   2. Fallback: earliestBuyTs + 14d — all qualifying trades are in markets
+        //      that resolve within 14 days of buy, so if 14d have passed since the
+        //      earliest buy with no profit signal, the market has expired.
         const marketEndTs = gammaMeta.get(cid);
-        const marketStillOpen = marketEndTs !== undefined && marketEndTs > now;
+        let marketStillOpen;
+        if (marketEndTs !== undefined) {
+          marketStillOpen = marketEndTs > now;
+        } else {
+          // gammaMeta missing — use buy+14d proxy
+          let earliestBuyTs = Infinity;
+          for (const t of trades) {
+            let ts = t.timestamp ?? 0;
+            if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+            if (ts > 0 && ts < earliestBuyTs) earliestBuyTs = ts;
+          }
+          marketStillOpen = earliestBuyTs !== Infinity && (earliestBuyTs + 14 * 86400000) > now;
+        }
         if (marketStillOpen) {
           openMarkets++;
         } else {
-          isLoss = true; // expired or end date unknown + no profit signal = loss
+          isLoss = true; // expired (or 14d+ since buy) + no profit signal = loss
           lastResortLosses++;
         }
       }
@@ -996,13 +1011,17 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
         }
       }
       totalPnl += mktPnl;
-      if (marketTs >= cutoff30d) { pnl30d += mktPnl; invested30d += mktInvested; }
+      if (marketTs >= cutoff30d) {
+        pnl30d += mktPnl; pnlWins30d += mktPnl; invested30d += mktInvested;
+      }
       const avgPrice = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
       if (avgPrice > 0 && avgPrice < 1) totalReturnMultiple += 1 / avgPrice;
     } else {
       losses++;
       totalPnl -= mktInvested;
-      if (marketTs >= cutoff30d) { pnl30d -= mktInvested; invested30d += mktInvested; }
+      if (marketTs >= cutoff30d) {
+        pnl30d -= mktInvested; pnlLosses30d += mktInvested; invested30d += mktInvested;
+      }
     }
 
     if (marketTs >= cutoff7d)  { total7d++;  if (isWin) wins7d++;  }
@@ -1028,6 +1047,9 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     winRate, winRate7d, winRate30d,
     totalPnl,
     pnl30d,
+    pnlWins30d,
+    pnlLosses30d,
+    profitFactor30d: pnlLosses30d > 0 ? pnlWins30d / pnlLosses30d : (pnlWins30d > 0 ? Infinity : 0),
     invested30d,
     totalInvested,
     roi,
@@ -1042,19 +1064,22 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
 }
 
 // ── Tier assignment ────────────────────────────────────────────────────────────
-// Criteria: resolvedCount (volume), winRate, AND minimum overall PnL.
-// PnL gate ensures we only rank wallets with meaningful real profit, not just
-// a high win rate on micro-bets that add up to nothing.
+// Criteria: resolvedCount, winRate, AND 30d profit factor ≥ 1.5
+// (30d gross wins / 30d gross losses ≥ 1.5 — e.g. $150 won per $100 lost).
+// If no 30d losses, any positive 30d PnL satisfies the criterion.
+// Also gates on totalPnl > 0 — must be net positive overall, not just recently.
 function assignTiers(m) {
   const tiers = [];
   if (!m || m.totalPnl <= 0) return tiers;
-  const n   = m.resolvedCount;
-  const pnl = m.totalPnl;
-  if (n >= 20 && m.winRate >= 0.70 && pnl >= 1000) tiers.push('S');
-  if (n >= 25 && m.winRate >= 0.60 && pnl >=  500) tiers.push(1);
-  if (n >= 20 && m.winRate >= 0.55 && pnl >=  200) tiers.push(2);
-  if (n >= 15 && m.winRate >= 0.50 && pnl >=  100) tiers.push(3);
-  if (n >= 10 && m.winRate >= 0.50 && pnl >     0) tiers.push(4);
+  const n  = m.resolvedCount;
+  const pf = m.profitFactor30d;          // gross wins30d / gross losses30d
+  const ok = pf >= 1.5 && m.pnl30d > 0; // 30d profit factor gate
+  if (!ok) return tiers;                 // no 30d profitable activity = no tier
+  if (n >= 20 && m.winRate >= 0.70) tiers.push('S');
+  if (n >= 25 && m.winRate >= 0.60) tiers.push(1);
+  if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
+  if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
+  if (n >= 10 && m.winRate >= 0.50) tiers.push(4);
   return tiers;
 }
 
@@ -1237,6 +1262,9 @@ async function runScan() {
         avgReturnMultiple:     m.avgReturnMultiple,
         overallPnl:            m.totalPnl,
         pnl30d:                m.pnl30d,
+        pnlWins30d:            m.pnlWins30d,
+        pnlLosses30d:          m.pnlLosses30d,
+        profitFactor30d:       isFinite(m.profitFactor30d) ? m.profitFactor30d : null,
         invested30d:           m.invested30d,
         totalInvested:         m.totalInvested,
         roi:                   m.roi,
