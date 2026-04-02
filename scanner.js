@@ -905,7 +905,8 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   let invested30d = 0;
   let totalReturnMultiple = 0;
   let totalInvested = 0;
-  let openMarkets = 0; // qualifying markets that are still open (excluded from win/loss)
+  let openMarkets = 0;      // qualifying markets still open (excluded from win/loss)
+  let lastResortLosses = 0; // losses assigned by last resort: expired/unknown end date + no profit
 
   for (const [cid, trades] of byMarket) {
     const posData   = posMap ? posMap.get(cid) : null;
@@ -957,6 +958,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
           openMarkets++;
         } else {
           isLoss = true; // expired or end date unknown + no profit signal = loss
+          lastResortLosses++;
         }
       }
     }
@@ -1034,21 +1036,25 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     lastTradeTs,
     lastTradeDate: lastTradeTs ? new Date(lastTradeTs).toISOString().split('T')[0] : null,
     total7d, total30d,
-    openMarkets,  // qualifying markets still open (excluded from win/loss counts)
+    openMarkets,       // qualifying markets still open (excluded from win/loss counts)
+    lastResortLosses,  // losses inferred by expiry/no-profit rule (no explicit resolution data)
   };
 }
 
 // ── Tier assignment ────────────────────────────────────────────────────────────
+// Criteria: resolvedCount (volume), winRate, AND minimum overall PnL.
+// PnL gate ensures we only rank wallets with meaningful real profit, not just
+// a high win rate on micro-bets that add up to nothing.
 function assignTiers(m) {
   const tiers = [];
   if (!m || m.totalPnl <= 0) return tiers;
-  // Use resolvedCount (not qualifyingCount) for tier thresholds
-  const n = m.resolvedCount;
-  if (n >= 20 && m.winRate >= 0.70) tiers.push('S');
-  if (n >= 25 && m.winRate >= 0.60) tiers.push(1);
-  if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
-  if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
-  if (n >= 10 && m.winRate >= 0.50) tiers.push(4);
+  const n   = m.resolvedCount;
+  const pnl = m.totalPnl;
+  if (n >= 20 && m.winRate >= 0.70 && pnl >= 1000) tiers.push('S');
+  if (n >= 25 && m.winRate >= 0.60 && pnl >=  500) tiers.push(1);
+  if (n >= 20 && m.winRate >= 0.55 && pnl >=  200) tiers.push(2);
+  if (n >= 15 && m.winRate >= 0.50 && pnl >=  100) tiers.push(3);
+  if (n >= 10 && m.winRate >= 0.50 && pnl >     0) tiers.push(4);
   return tiers;
 }
 
@@ -1159,7 +1165,8 @@ async function runScan() {
     const address = allWallets[i];
     processed++;
     if (processed % 50 === 0) {
-      log(`Progress: ${processed}/${allWallets.length} | S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} | bot=${skippedBot} inactive=${skippedActivity} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
+      const lrTotal = [...seen.values()].reduce((s, r) => s + (r.lastResortLosses || 0), 0);
+      log(`Progress: ${processed}/${allWallets.length} | S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} | bot=${skippedBot} inactive=${skippedActivity} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier} | lastResort=${lrTotal}`);
     }
 
     // Save checkpoint every 200 wallets
@@ -1234,6 +1241,7 @@ async function runScan() {
         totalInvested:         m.totalInvested,
         roi:                   m.roi,
         openMarkets:           m.openMarkets,
+        lastResortLosses:      m.lastResortLosses,
         lastTradeDate:         m.lastTradeDate,
         tiers,
         score,
