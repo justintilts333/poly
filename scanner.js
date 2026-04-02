@@ -901,8 +901,10 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   let wins30d = 0, total30d = 0;
   let totalEntryPrice = 0, totalTradeCount = 0;
   let totalPnl = 0;
+  let pnlWinsAll = 0;   // gross profit from all wins
+  let pnlLossesAll = 0; // gross loss from all losses (absolute value)
   let pnl30d = 0;
-  let pnlWins30d = 0;   // gross profit from 30d wins (for profit-factor criterion)
+  let pnlWins30d = 0;   // gross profit from 30d wins
   let pnlLosses30d = 0; // gross loss from 30d losses (absolute value)
   let invested30d = 0;
   let totalReturnMultiple = 0;
@@ -1011,6 +1013,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
         }
       }
       totalPnl += mktPnl;
+      pnlWinsAll += mktPnl;
       if (marketTs >= cutoff30d) {
         pnl30d += mktPnl; pnlWins30d += mktPnl; invested30d += mktInvested;
       }
@@ -1019,6 +1022,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     } else {
       losses++;
       totalPnl -= mktInvested;
+      pnlLossesAll += mktInvested;
       if (marketTs >= cutoff30d) {
         pnl30d -= mktInvested; pnlLosses30d += mktInvested; invested30d += mktInvested;
       }
@@ -1046,6 +1050,9 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     wins, losses,
     winRate, winRate7d, winRate30d,
     totalPnl,
+    pnlWinsAll,
+    pnlLossesAll,
+    profitFactorAll: pnlLossesAll > 0 ? pnlWinsAll / pnlLossesAll : (pnlWinsAll > 0 ? Infinity : 0),
     pnl30d,
     pnlWins30d,
     pnlLosses30d,
@@ -1071,10 +1078,12 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
 function assignTiers(m) {
   const tiers = [];
   if (!m || m.totalPnl <= 0) return tiers;
-  const n  = m.resolvedCount;
-  const pf = m.profitFactor30d;          // gross wins30d / gross losses30d
-  const ok = pf >= 1.5 && m.pnl30d > 0; // 30d profit factor gate
-  if (!ok) return tiers;                 // no 30d profitable activity = no tier
+  const n = m.resolvedCount;
+  // 30d gate: gross wins ≥ 1.5× gross losses in last 30 days
+  const ok30d = m.profitFactor30d >= 1.5 && m.pnl30d > 0;
+  // All-time gate: gross wins ≥ 1.2× gross losses overall
+  const okAll = m.profitFactorAll >= 1.2;
+  if (!ok30d || !okAll) return tiers;
   if (n >= 20 && m.winRate >= 0.70) tiers.push('S');
   if (n >= 25 && m.winRate >= 0.60) tiers.push(1);
   if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
@@ -1261,6 +1270,9 @@ async function runScan() {
         avgEntryPrice:         m.avgEntryPrice,
         avgReturnMultiple:     m.avgReturnMultiple,
         overallPnl:            m.totalPnl,
+        pnlWinsAll:            m.pnlWinsAll,
+        pnlLossesAll:          m.pnlLossesAll,
+        profitFactorAll:       isFinite(m.profitFactorAll) ? m.profitFactorAll : null,
         pnl30d:                m.pnl30d,
         pnlWins30d:            m.pnlWins30d,
         pnlLosses30d:          m.pnlLosses30d,
