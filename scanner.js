@@ -533,13 +533,14 @@ async function fetchMarketTraders(topMarkets) {
     const { conditionId } = topMarkets[i];
 
     if (useH556) {
-      // Agent 556: paginate BUY trades for this market, filter price < 0.50
-      let offset = 0;
-      while (true) {
-        try {
-          const r = await h574SessionRef.call(556, { condition_id: conditionId, side: 'BUY', offset, limit: 200 });
-          const text = r?.result?.content?.[0]?.text || '{}';
-          const parsed = JSON.parse(text);
+      // Agent 556: fetch BUY trades for this market, filter price < 0.50
+      try {
+        const r = await h574SessionRef.call(556, { condition_id: conditionId, side: 'BUY' });
+        const text = r?.result?.content?.[0]?.text || '{}';
+        const parsed = JSON.parse(text);
+        if (parsed?.error) {
+          log(`  agent 556 error for ${conditionId.slice(0, 10)}: ${parsed.error}`);
+        } else {
           const rows = parsed?.data?.results || [];
           for (const t of rows) {
             if (parseFloat(t.price) < 0.50) {
@@ -547,13 +548,11 @@ async function fetchMarketTraders(topMarkets) {
               if (addr) wallets.add(addr);
             }
           }
-          if (!parsed?.pagination?.has_more) break;
-          offset += 200;
-          await sleep(100);
-        } catch (_) {
-          break;
         }
+      } catch (err) {
+        log(`  agent 556 threw for ${conditionId.slice(0, 10)}: ${err.message}`);
       }
+      await sleep(300);
     } else {
       // Fallback: holders endpoint (no price filter, broader pool)
       try {
