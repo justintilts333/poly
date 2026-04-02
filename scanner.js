@@ -824,12 +824,21 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sells
 
     const cid = (t.conditionId || t.condition_id || '').toLowerCase();
 
-    // Primary: in our pre-fetched short-resolution market set
-    if (shortConditionIds.size > 0 && shortConditionIds.has(cid)) return true;
-
     let buyTs = t.timestamp ?? 0;
     if (typeof buyTs === 'string') buyTs = new Date(buyTs).getTime() || 0;
     if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
+
+    // Primary: in our pre-fetched short-resolution market set — confirm endTs - buyTs ≤ 14d
+    // so an old buy in a market that happens to expire soon doesn't incorrectly qualify.
+    if (shortConditionIds.size > 0 && shortConditionIds.has(cid)) {
+      const endTs = gammaMeta.get(cid);
+      // If we have the end date, enforce the 14-day window from buy time
+      if (endTs && buyTs > 0) {
+        if (endTs - buyTs <= 14 * 86400000 && endTs >= buyTs) return true;
+      } else {
+        return true; // no end date in meta — pass through, calcMetrics will verify
+      }
+    }
 
     // Secondary: wallet has a REDEEM within 14 days of the BUY (win path)
     if (redeemByKey && redeemByKey.has(cid)) {
@@ -937,17 +946,17 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
         if (walletOI === winnerOutcomeIndex) isWin = true;
         else isLoss = true;
       } else {
-        // No resolution data from any source. Determine open vs. expired.
-        // gammaMeta is pre-populated for all markets in our scan (both upcoming and closed).
+        // No resolution data from any source.
+        // Only skip if we can positively confirm the market is still open (endTs in future).
+        // Otherwise: no profit signal (no REDEEM, no positive PnL) = loss.
+        // Treating "unknown" as "open" would systematically exclude potential losses and
+        // inflate win rates — the wallet would only look bad when wins self-report via REDEEM.
         const marketEndTs = gammaMeta.get(cid);
-        if (marketEndTs !== undefined && marketEndTs < now) {
-          // Market has expired — wallet had no REDEEM and we can't find the winner.
-          // Positions API negative realizedPnl is a confirmed loss; otherwise assume loss
-          // (expired + no REDEEM = wallet did not hold winning outcome).
-          isLoss = true;
-        } else {
-          // Market is still open (endTs in future) or end date unknown — exclude from counts.
+        const marketStillOpen = marketEndTs !== undefined && marketEndTs > now;
+        if (marketStillOpen) {
           openMarkets++;
+        } else {
+          isLoss = true; // expired or end date unknown + no profit signal = loss
         }
       }
     }
