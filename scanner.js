@@ -470,12 +470,14 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
     }
   }
 
-  // --- Pass 2: recently-closed markets (hard cap: 20 pages / 10,000 rows) ---
+  // --- Pass 2: recently-closed markets (hard cap: 60 pages / 30,000 rows) ---
   // These give us TRUE LOSS detection: wallet bought the losing outcome.
-  const MAX_CLOSED_PAGES = 20;
+  // Note: gamma API does NOT sort closed markets by end_date, so we must paginate
+  // all pages — cannot early-exit based on "too old" count.
+  const MAX_CLOSED_PAGES = 60;
   let closedOffset = 0;
-  let closedDone = false;
-  while (!closedDone && closedOffset < MAX_CLOSED_PAGES * pageSize) {
+  let closedConsecutiveEmpty = 0;
+  while (closedOffset < MAX_CLOSED_PAGES * pageSize) {
     try {
       const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${closedOffset}&closed=true`;
       const data = await fetchJSON(url);
@@ -506,7 +508,12 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
 
       log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} qualifying, ${tooOld} old, ${tooSmall} too small, resolvedMap=${resolvedMarketMap.size}`);
 
-      if (tooOld > rows.length * 0.7 || rows.length < pageSize) closedDone = true;
+      // Only stop early if we hit end of data
+      if (rows.length < pageSize) break;
+      if (added === 0) closedConsecutiveEmpty++;
+      else closedConsecutiveEmpty = 0;
+      // Stop if 10 consecutive pages with no qualifying results (all old or small)
+      if (closedConsecutiveEmpty >= 10) { log('  Closed markets: 10 consecutive empty pages, stopping'); break; }
       closedOffset += pageSize;
       await sleep(200);
     } catch (e) {
@@ -710,7 +717,7 @@ function buildRedeemInfo(allTrades) {
 //   b) market is "short-resolution" — either:
 //      i.  conditionId is in our upcoming <14d set (will resolve soon), OR
 //      ii. there is a REDEEM within 14 days of the BUY (already resolved quickly)
-function filterQualifyingTrades(allTrades, shortConditionIds) {
+function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey) {
   return allTrades.filter(t => {
     // Must be a BUY
     const tType = (t.type || '').toUpperCase();
@@ -722,9 +729,22 @@ function filterQualifyingTrades(allTrades, shortConditionIds) {
     const price = parseFloat(t.price ?? t.avgPrice ?? t.avg_price ?? 1);
     if (isNaN(price) || price >= 0.50) return false;
 
-    // Market must be in our short-resolution set (resolves within 14 days)
     const cid = (t.conditionId || t.condition_id || '').toLowerCase();
-    return shortConditionIds.size > 0 && shortConditionIds.has(cid);
+
+    // Primary: in our pre-fetched short-resolution market set
+    if (shortConditionIds.size > 0 && shortConditionIds.has(cid)) return true;
+
+    // Secondary: wallet has a REDEEM for this conditionId within 14 days of the BUY
+    // (confirms the market was short-resolution and already resolved — wallet won)
+    if (redeemByKey && redeemByKey.has(cid)) {
+      let buyTs = t.timestamp ?? 0;
+      if (typeof buyTs === 'string') buyTs = new Date(buyTs).getTime() || 0;
+      if (typeof buyTs === 'number' && buyTs > 0 && buyTs < 1e12) buyTs *= 1000;
+      const redeemTs = redeemByKey.get(cid);
+      if (buyTs > 0 && redeemTs > buyTs && redeemTs - buyTs <= 14 * 86400000) return true;
+    }
+
+    return false;
   });
 }
 
@@ -1021,7 +1041,7 @@ async function runScan() {
       const { redeemByKey, resolvedCids, sellsByMarket } = buildRedeemInfo(allTrades);
 
       // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
-      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds);
+      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey);
       if (!allQualifying.length) { skippedNoQualifying++; continue; }
       const qualifying = allQualifying.slice(0, 30);
 
