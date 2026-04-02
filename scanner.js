@@ -489,7 +489,7 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
   const pageSize        = 500;
   const now             = Date.now();
   const deadlineCutoff  = now + maxDays * 86400000;
-  const closedLookback  = now - maxDays * 86400000; // closed in the last maxDays days
+  const closedLookback  = now - 90 * 86400000; // closed in the last 90 days (wider window catches historical losses)
 
   // --- Pass 1: active upcoming markets (hard cap: 60 pages / 30,000 rows) ---
   const MAX_ACTIVE_PAGES = 60;
@@ -561,6 +561,13 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
 
         const winner = parseWinnerOutcomeIndex(m.outcomePrices);
         if (winner !== null) resolvedMarketMap.set(cid, winner);
+        // Pre-populate gammaOutcomeCache and gammaMeta so filterQualifyingTrades path 4
+        // can catch losses (hold-to-zero) in historical closed markets without relying on
+        // order-dependent lazy fetches. This makes win/loss detection symmetric.
+        if (!gammaOutcomeCache.has(cid)) {
+          gammaOutcomeCache.set(cid, winner !== null ? winner : undefined);
+          gammaMeta.set(cid, endTs);
+        }
       }
 
       log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} qualifying, ${tooOld} old, ${tooSmall} too small, resolvedMap=${resolvedMarketMap.size}`);
