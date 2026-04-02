@@ -530,9 +530,10 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
   // These give us TRUE LOSS detection: wallet bought the losing outcome.
   // Note: gamma API does NOT sort closed markets by end_date, so we must paginate
   // all pages — cannot early-exit based on "too old" count.
+  // gamma does NOT sort closed markets by end_date — recent markets are scattered
+  // across all pages. Must scan all 60 pages; no consecutive-empty early exit.
   const MAX_CLOSED_PAGES = 60;
   let closedOffset = 0;
-  let closedConsecutiveEmpty = 0;
   while (closedOffset < MAX_CLOSED_PAGES * pageSize) {
     try {
       const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${closedOffset}&closed=true`;
@@ -564,12 +565,7 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
 
       log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} qualifying, ${tooOld} old, ${tooSmall} too small, resolvedMap=${resolvedMarketMap.size}`);
 
-      // Only stop early if we hit end of data
-      if (rows.length < pageSize) break;
-      if (added === 0) closedConsecutiveEmpty++;
-      else closedConsecutiveEmpty = 0;
-      // Stop if 10 consecutive pages with no qualifying results (all old or small)
-      if (closedConsecutiveEmpty >= 10) { log('  Closed markets: 10 consecutive empty pages, stopping'); break; }
+      if (rows.length < pageSize) break; // end of data
       closedOffset += pageSize;
       await sleep(200);
     } catch (e) {

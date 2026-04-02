@@ -524,15 +524,14 @@ app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISO
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Polymarket Scanner dashboard running at http://0.0.0.0:${PORT}`);
 
-  // Auto-trigger a scan on startup (i.e. after every deploy).
+  // Auto-trigger a fresh scan on startup (i.e. after every deploy).
   // Delay 5s to let PM2 finish restarting other processes first.
+  // Kill any stale scanner from a previous deploy before starting the new one.
   setTimeout(() => {
     try {
-      const existing = execSync("pgrep -f 'node.*scanner.js' || true", { encoding: 'utf8' }).trim();
-      if (existing) {
-        console.log(`Scanner already running (PID ${existing}) — skipping auto-trigger`);
-        return;
-      }
+      // Kill any lingering scanner and clear its lock
+      execSync("pkill -f 'node.*scanner.js' 2>/dev/null || true", { encoding: 'utf8' });
+      try { fs.unlinkSync('/tmp/polymarket-scanner.lock'); } catch (_) {}
       const logStream = fs.openSync(LOG_FILE, 'a');
       const child = spawn('node', ['--max-old-space-size=768', path.join(__dirname, 'scanner.js')], {
         detached: true,
