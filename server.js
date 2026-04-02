@@ -528,10 +528,10 @@ app.listen(PORT, '0.0.0.0', () => {
   // Delay 5s to let PM2 finish restarting other processes first.
   // Kill any stale scanner from a previous deploy before starting the new one.
   setTimeout(() => {
+    // Kill any lingering scanner and clear its lock
+    try { execSync("pkill -f 'node.*scanner.js'", { stdio: 'ignore' }); } catch (_) {}
+    try { fs.unlinkSync('/tmp/polymarket-scanner.lock'); } catch (_) {}
     try {
-      // Kill any lingering scanner and clear its lock
-      execSync("pkill -f 'node.*scanner.js' 2>/dev/null || true", { encoding: 'utf8' });
-      try { fs.unlinkSync('/tmp/polymarket-scanner.lock'); } catch (_) {}
       const logStream = fs.openSync(LOG_FILE, 'a');
       const child = spawn('node', ['--max-old-space-size=768', path.join(__dirname, 'scanner.js')], {
         detached: true,
