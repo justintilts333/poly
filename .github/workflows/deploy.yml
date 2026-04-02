@@ -63,10 +63,3 @@ jobs:
 
             echo "=== Deploy complete ==="
             pm2 status
-
-            # Trigger a fresh scan in background after every deploy
-            pkill -f "node.*scanner.js" 2>/dev/null || true
-            rm -f /tmp/polymarket-scanner.lock
-            sleep 1
-            nohup node --max-old-space-size=768 "$APP_DIR/scanner.js" >> "$LOG_FILE" 2>&1 &
-            echo "Scanner triggered (PID: $!)"
