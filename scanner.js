@@ -513,6 +513,8 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
           if (vol < MIN_MARKET_VOLUME) { tooSmall++; continue; }
           conditionIds.add(cid);
           allMarkets.push({ conditionId: cid, endTs, volume: vol });
+          // Store endTs so calcMetrics can distinguish open vs. expired markets
+          if (!gammaMeta.has(cid)) gammaMeta.set(cid, endTs);
           added++;
         }
       }
@@ -890,8 +892,11 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   let wins30d = 0, total30d = 0;
   let totalEntryPrice = 0, totalTradeCount = 0;
   let totalPnl = 0;
+  let pnl30d = 0;
+  let invested30d = 0;
   let totalReturnMultiple = 0;
   let totalInvested = 0;
+  let openMarkets = 0; // qualifying markets that are still open (excluded from win/loss)
 
   for (const [cid, trades] of byMarket) {
     const posData   = posMap ? posMap.get(cid) : null;
@@ -932,14 +937,22 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
         if (walletOI === winnerOutcomeIndex) isWin = true;
         else isLoss = true;
       } else {
-        // No resolution data available — last resort: positions/redeem signals
-        const marketResolved = resolvedCids.has(cid) ||
-          (posData && posData.realizedPnl !== 0);
-        isLoss = marketResolved;
+        // No resolution data from any source. Determine open vs. expired.
+        // gammaMeta is pre-populated for all markets in our scan (both upcoming and closed).
+        const marketEndTs = gammaMeta.get(cid);
+        if (marketEndTs !== undefined && marketEndTs < now) {
+          // Market has expired — wallet had no REDEEM and we can't find the winner.
+          // Positions API negative realizedPnl is a confirmed loss; otherwise assume loss
+          // (expired + no REDEEM = wallet did not hold winning outcome).
+          isLoss = true;
+        } else {
+          // Market is still open (endTs in future) or end date unknown — exclude from counts.
+          openMarkets++;
+        }
       }
     }
 
-    if (!isWin && !isLoss) continue; // still unresolved — skip
+    if (!isWin && !isLoss) continue; // open or truly unresolvable — excluded from win/loss
 
     // Use latest trade timestamp in this market for time-window bucketing
     let marketTs = 0;
@@ -956,23 +969,29 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
       totalInvested += parseFloat(t.usdcSize ?? 0);
     }
 
+    const mktInvested = trades.reduce((s, t) => s + parseFloat(t.usdcSize ?? 0), 0);
+
     if (isWin) {
       wins++;
+      let mktPnl = 0;
       if (posData && posData.realizedPnl !== 0) {
-        totalPnl += posData.realizedPnl;
+        mktPnl = posData.realizedPnl;
       } else {
         for (const t of trades) {
           const usdcSize = parseFloat(t.usdcSize ?? 0);
           const shares   = parseFloat(t.size ?? 0);
           const price    = parseFloat(t.price ?? 0);
-          totalPnl += shares > 0 ? shares - usdcSize : usdcSize * (1 / Math.max(price, 0.001) - 1);
+          mktPnl += shares > 0 ? shares - usdcSize : usdcSize * (1 / Math.max(price, 0.001) - 1);
         }
       }
+      totalPnl += mktPnl;
+      if (marketTs >= cutoff30d) { pnl30d += mktPnl; invested30d += mktInvested; }
       const avgPrice = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
       if (avgPrice > 0 && avgPrice < 1) totalReturnMultiple += 1 / avgPrice;
     } else {
       losses++;
-      totalPnl -= trades.reduce((s, t) => s + parseFloat(t.usdcSize ?? 0), 0);
+      totalPnl -= mktInvested;
+      if (marketTs >= cutoff30d) { pnl30d -= mktInvested; invested30d += mktInvested; }
     }
 
     if (marketTs >= cutoff7d)  { total7d++;  if (isWin) wins7d++;  }
@@ -997,6 +1016,8 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     wins, losses,
     winRate, winRate7d, winRate30d,
     totalPnl,
+    pnl30d,
+    invested30d,
     totalInvested,
     roi,
     avgEntryPrice,
@@ -1004,6 +1025,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     lastTradeTs,
     lastTradeDate: lastTradeTs ? new Date(lastTradeTs).toISOString().split('T')[0] : null,
     total7d, total30d,
+    openMarkets,  // qualifying markets still open (excluded from win/loss counts)
   };
 }
 
@@ -1198,8 +1220,11 @@ async function runScan() {
         avgEntryPrice:         m.avgEntryPrice,
         avgReturnMultiple:     m.avgReturnMultiple,
         overallPnl:            m.totalPnl,
+        pnl30d:                m.pnl30d,
+        invested30d:           m.invested30d,
         totalInvested:         m.totalInvested,
         roi:                   m.roi,
+        openMarkets:           m.openMarkets,
         lastTradeDate:         m.lastTradeDate,
         tiers,
         score,

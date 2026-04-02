@@ -86,7 +86,9 @@ function buildTableRows(wallets) {
         <td class="${isNaN(w.winRate7d) ? '' : (w.winRate7d >= 0.5 ? 'pos' : 'neg')}">${pctFmt(w.winRate7d)}</td>
         <td class="${isNaN(w.winRate30d) ? '' : (w.winRate30d >= 0.5 ? 'pos' : 'neg')}">${pctFmt(w.winRate30d)}</td>
         <td>$${fmt(w.avgEntryPrice, 3)}</td>
+        <td class="${pnlClass(w.pnl30d)}">${w.pnl30d != null ? pnlFmt(w.pnl30d) : 'N/A'}</td>
         <td class="${pnlClass(w.overallPnl)}">${pnlFmt(w.overallPnl)}</td>
+        <td>${w.openMarkets || 0}</td>
         <td>${w.lastTradeDate || 'N/A'}</td>
         <td>${tierBadges}</td>
         <td class="score">${fmt(w.score, 3)}</td>
@@ -261,7 +263,9 @@ function buildPage(results, execStatus) {
       <th>Win Rate 7d</th>
       <th>Win Rate 30d</th>
       <th>Avg Entry Price</th>
+      <th>PnL 30d</th>
       <th>Overall PnL</th>
+      <th>Open</th>
       <th>Last Trade</th>
       <th>Tiers</th>
       <th>Score ▼</th>
