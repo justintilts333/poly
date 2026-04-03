@@ -343,7 +343,9 @@ async function prefetchGammaOutcomes(allTrades, shortConditionIds, redeemByKey) 
     if (isNaN(price) || price >= 0.50) continue;
     const cid = (t.conditionId || t.condition_id || '').toLowerCase();
     if (!cid || shortConditionIds.has(cid) || gammaOutcomeCache.has(cid)) continue;
-    if (redeemByKey && redeemByKey.has(cid)) continue;
+    // Only skip if it's a profitable REDEEM (confirmed win) — $0 REDEEMs (losses)
+    // still need gamma lookup to confirm the loss outcome index.
+    if (redeemByKey && redeemByKey.get(cid)?.isWin) continue;
     toFetch.add(cid);
   }
   // Fetch in batches of 5 to balance speed vs rate limiting
@@ -734,11 +736,12 @@ function getLastTradeTs(allTrades) {
 }
 
 // ── Win detection: build REDEEM map ───────────────────────────────────────────
-// The data-api activity endpoint does NOT include cashPnl.
-// Instead, a "REDEEM" event means the market resolved in the user's favour for
-// that conditionId + outcomeIndex pair.  We use that as our win signal.
+// REDEEM events have two types:
+//   isWin=true  (usdcSize > 0): wallet redeemed winning tokens for USDC → actual win
+//   isWin=false (usdcSize = 0): wallet redeemed losing tokens for $0    → actual loss
+// We track both for qualifying-trade timing, but only isWin=true is a win signal.
 //
-// redeemByKey:   Map<"conditionId:outcomeIndex" -> redeemTimestamp>
+// redeemByKey:   Map<conditionId → { ts, isWin }>
 // resolvedCids:  Set<conditionId> — any conditionId that has ANY redeem
 //                (meaning the market is resolved, whichever side won)
 function buildRedeemInfo(allTrades) {
@@ -752,11 +755,20 @@ function buildRedeemInfo(allTrades) {
     if (!cid) continue;
 
     if (tType === 'REDEEM' || tType === 'REDEMPTION') {
-      // outcomeIndex is always 999 in REDEEM events — key by conditionId only
+      // outcomeIndex is always 999 in REDEEM events — key by conditionId only.
+      // usdcSize > 0 = winning redeem (wallet got paid); usdcSize = 0 = losing redeem
+      // (position redeemed for $0 — market resolved against the wallet).
+      // Track BOTH for resolution timing, but only mark isWin for profitable redeems.
       let ts = t.timestamp ?? 0;
       if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
-      if (!redeemByKey.has(cid) || ts > redeemByKey.get(cid)) {
-        redeemByKey.set(cid, ts || Date.now());
+      const usdcSize = parseFloat(t.usdcSize ?? 0);
+      const isWin = usdcSize > 0;
+      const existing = redeemByKey.get(cid);
+      if (!existing || ts > existing.ts) {
+        redeemByKey.set(cid, { ts: ts || Date.now(), isWin });
+      } else if (isWin && !existing.isWin) {
+        // Upgrade to win if any redeem for this market was profitable
+        redeemByKey.set(cid, { ...existing, isWin: true });
       }
       resolvedCids.add(cid);
     } else if ((t.side || '').toUpperCase() === 'SELL') {
@@ -840,9 +852,10 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sells
       }
     }
 
-    // Secondary: wallet has a REDEEM within 14 days of the BUY (win path)
+    // Secondary: wallet has a REDEEM within 14 days of the BUY (resolution confirmed — win OR loss)
     if (redeemByKey && redeemByKey.has(cid)) {
-      const redeemTs = redeemByKey.get(cid);
+      const redeemEntry = redeemByKey.get(cid);
+      const redeemTs = redeemEntry.ts;
       if (buyTs > 0 && redeemTs > buyTs && redeemTs - buyTs <= 14 * 86400000) return true;
     }
 
@@ -915,7 +928,9 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   for (const [cid, trades] of byMarket) {
     const posData   = posMap ? posMap.get(cid) : null;
     const hasPosWin = posData && posData.realizedPnl > 0; // realizedPnl only — cashPnl is unrealized (open position)
-    const redeemTs  = redeemByKey.get(cid);
+    const redeemEntry = redeemByKey.get(cid);
+    const redeemTs    = redeemEntry?.ts;   // timestamp for time-window checks
+    const redeemIsWin = redeemEntry?.isWin ?? false; // only true if usdcSize > 0 (paid out)
 
     // Exit detection via SELL events: compare sell prices to avg buy price
     const avgBuyPrice  = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
@@ -924,7 +939,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     const profitableExit = sellPrices.some(p => p > avgBuyPrice);
     const lossExit       = sellPrices.length > 0 && Math.max(...sellPrices) < avgBuyPrice;
 
-    let isWin  = hasPosWin || !!redeemTs || profitableExit;
+    let isWin  = hasPosWin || redeemIsWin || profitableExit;
     let isLoss = !isWin && lossExit; // sold at a loss and never redeemed → confirmed loss
 
     if (!isWin && !isLoss) {
