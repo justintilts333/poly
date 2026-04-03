@@ -477,7 +477,7 @@ function parseWinnerOutcomeIndex(outcomePrices) {
   try {
     const prices = typeof outcomePrices === 'string' ? JSON.parse(outcomePrices) : outcomePrices;
     for (let i = 0; i < prices.length; i++) {
-      if (parseFloat(prices[i]) >= 0.99) return i;
+      if (parseFloat(prices[i]) >= 0.95) return i;
     }
   } catch (_) {}
   return null;
