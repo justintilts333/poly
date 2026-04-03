@@ -556,22 +556,23 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
         const cid = (m.conditionId || m.condition_id || '').toLowerCase();
         if (!cid) continue;
 
-        const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
-        if (vol < MIN_MARKET_VOLUME) { tooSmall++; continue; }
-
-        conditionIds.add(cid);
-        allMarkets.push({ conditionId: cid, endTs, volume: vol });
-        added++;
-
+        // Always populate resolution caches regardless of volume — any closed market
+        // can be a silent loss (wallet held losing tokens to $0, never redeemed).
+        // Omitting low-volume markets here causes those losses to be silently dropped.
         const winner = parseWinnerOutcomeIndex(m.outcomePrices);
         if (winner !== null) resolvedMarketMap.set(cid, winner);
-        // Pre-populate gammaOutcomeCache and gammaMeta so filterQualifyingTrades path 4
-        // can catch losses (hold-to-zero) in historical closed markets without relying on
-        // order-dependent lazy fetches. This makes win/loss detection symmetric.
         if (!gammaOutcomeCache.has(cid)) {
           gammaOutcomeCache.set(cid, winner !== null ? winner : undefined);
           gammaMeta.set(cid, endTs);
         }
+
+        const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
+        if (vol < MIN_MARKET_VOLUME) { tooSmall++; continue; }
+
+        // Only high-volume markets go into allMarkets (used for top-300 wallet discovery)
+        conditionIds.add(cid);
+        allMarkets.push({ conditionId: cid, endTs, volume: vol });
+        added++;
       }
 
       log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} qualifying, ${tooOld} old, ${tooSmall} too small, resolvedMap=${resolvedMarketMap.size}`);
@@ -884,6 +885,19 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sells
       const endTs = gammaMeta.get(cid);
       if (endTs) {
         if (buyTs > 0 && endTs - buyTs <= 14 * 86400000 && endTs >= buyTs) return true;
+      }
+    }
+
+    // Quinary: gammaMeta has an end date for this market that has already passed,
+    // within 14 days of the BUY. Catches silent hold-to-zero losses in ANY closed
+    // market — even low-volume ones not in resolvedMarketMap. calcMetrics will use
+    // last resort (expired + no profit signal = loss) when winner is unknown.
+    {
+      const metaEndTs = gammaMeta.get(cid);
+      const nowMs = Date.now();
+      if (metaEndTs && metaEndTs <= nowMs && buyTs > 0 &&
+          metaEndTs - buyTs <= 14 * 86400000 && metaEndTs >= buyTs) {
+        return true;
       }
     }
 
