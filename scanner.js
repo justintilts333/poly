@@ -1153,8 +1153,9 @@ function clearCheckpoint() {
 async function runScan() {
   log('=== Polymarket Wallet Scanner v3 (two-segment) ===');
 
-  // ── Resume from checkpoint if available ──────────────────────────────────────
-  const ckpt = loadCheckpoint();
+  // ── Always start fresh — clear any stale checkpoint ──────────────────────────
+  clearCheckpoint();
+  const ckpt = null;
   let segment1, shortConditionIds, resolvedMarketMap, allWallets, startIndex;
   let tierS, tier1, tier2, tier3, tier4, seen;
   let processed, skippedBot, skippedActivity, skippedNoTrades,
