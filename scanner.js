@@ -757,19 +757,26 @@ function buildRedeemInfo(allTrades) {
 
     if (tType === 'REDEEM' || tType === 'REDEMPTION') {
       // outcomeIndex is always 999 in REDEEM events — key by conditionId only.
-      // usdcSize > 0 = winning redeem (wallet got paid); usdcSize = 0 = losing redeem
-      // (position redeemed for $0 — market resolved against the wallet).
-      // Track BOTH for resolution timing, but only mark isWin for profitable redeems.
+      // usdcSize > 0 = winning redeem; usdcSize = 0 = losing redeem ($0 payout).
+      // A wallet that bought BOTH outcomes will have both a win and a zero REDEEM
+      // for the same conditionId. We track both signals independently:
+      //   isWin        = true if ANY profitable REDEEM exists
+      //   hasZeroRedeem = true if ANY $0 REDEEM exists
+      // When both are true (hasMixed), we cannot short-circuit — we must fall
+      // through to resolvedMarketMap to check which outcome the qualifying BUY was on.
       let ts = t.timestamp ?? 0;
       if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
       const usdcSize = parseFloat(t.usdcSize ?? 0);
       const isWin = usdcSize > 0;
       const existing = redeemByKey.get(cid);
-      if (!existing || ts > existing.ts) {
-        redeemByKey.set(cid, { ts: ts || Date.now(), isWin });
-      } else if (isWin && !existing.isWin) {
-        // Upgrade to win if any redeem for this market was profitable
-        redeemByKey.set(cid, { ...existing, isWin: true });
+      if (!existing) {
+        redeemByKey.set(cid, { ts: ts || Date.now(), isWin, hasZeroRedeem: !isWin });
+      } else {
+        redeemByKey.set(cid, {
+          ts: Math.max(ts || 0, existing.ts),          // keep latest REDEEM timestamp
+          isWin: existing.isWin || isWin,               // true if any REDEEM paid out
+          hasZeroRedeem: existing.hasZeroRedeem || !isWin, // true if any REDEEM was $0
+        });
       }
       resolvedCids.add(cid);
     } else if ((t.side || '').toUpperCase() === 'SELL') {
@@ -942,9 +949,13 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   for (const [cid, trades] of byMarket) {
     const posData   = posMap ? posMap.get(cid) : null;
     const hasPosWin = posData && posData.realizedPnl > 0; // realizedPnl only — cashPnl is unrealized (open position)
-    const redeemEntry = redeemByKey.get(cid);
-    const redeemTs    = redeemEntry?.ts;   // timestamp for time-window checks
-    const redeemIsWin = redeemEntry?.isWin ?? false; // only true if usdcSize > 0 (paid out)
+    const redeemEntry    = redeemByKey.get(cid);
+    const redeemTs       = redeemEntry?.ts;            // latest REDEEM timestamp (for time-window checks)
+    const redeemIsWin    = redeemEntry?.isWin ?? false;
+    // hasMixed: wallet bought BOTH outcomes — has a profitable AND a $0 REDEEM.
+    // Cannot short-circuit; must fall through to resolvedMarketMap to determine
+    // which outcome the qualifying BUY was on vs which outcome won.
+    const redeemHasMixed = !!(redeemEntry?.isWin && redeemEntry?.hasZeroRedeem);
 
     // Exit detection via SELL events: compare sell prices to avg buy price
     const avgBuyPrice  = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
@@ -953,10 +964,10 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     const profitableExit = sellPrices.some(p => p > avgBuyPrice);
     const lossExit       = sellPrices.length > 0 && Math.max(...sellPrices) < avgBuyPrice;
 
-    let isWin  = hasPosWin || redeemIsWin || profitableExit;
-    // isLoss: confirmed loss via sell-below-buy OR $0 REDEEM (wallet redeemed losing tokens for nothing)
-    // A $0 REDEEM is a definitive loss signal — no gamma lookup needed.
-    let isLoss = !isWin && (lossExit || (redeemEntry !== undefined && !redeemEntry.isWin));
+    // Only short-circuit on REDEEM signals when unambiguous (no mixed outcome).
+    // Mixed → fall through to resolvedMarketMap to check qualifying BUY outcomeIndex.
+    let isWin  = hasPosWin || (redeemIsWin && !redeemHasMixed) || profitableExit;
+    let isLoss = !isWin && (lossExit || (redeemEntry !== undefined && !redeemEntry.isWin && !redeemHasMixed));
 
     if (!isWin && !isLoss) {
       // Try gamma resolvedMarketMap first (no API call, fast)
