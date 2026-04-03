@@ -954,7 +954,9 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     const lossExit       = sellPrices.length > 0 && Math.max(...sellPrices) < avgBuyPrice;
 
     let isWin  = hasPosWin || redeemIsWin || profitableExit;
-    let isLoss = !isWin && lossExit; // sold at a loss and never redeemed → confirmed loss
+    // isLoss: confirmed loss via sell-below-buy OR $0 REDEEM (wallet redeemed losing tokens for nothing)
+    // A $0 REDEEM is a definitive loss signal — no gamma lookup needed.
+    let isLoss = !isWin && (lossExit || (redeemEntry !== undefined && !redeemEntry.isWin));
 
     if (!isWin && !isLoss) {
       // Try gamma resolvedMarketMap first (no API call, fast)
