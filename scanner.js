@@ -649,9 +649,12 @@ async function fetchMarketTraders(topMarkets) {
   return wallets;
 }
 
-// ── Wallet positions (cashPnl / realizedPnl) ──────────────────────────────────
+// ── Wallet positions (cashPnl / realizedPnl / curPrice) ───────────────────────
+// posMap has TWO kinds of keys:
+//   cid             → { cashPnl, realizedPnl }          (aggregated — for win signal)
+//   cid:outcomeIndex → { curPrice, realizedPnl, size }   (per-outcome — for loss signal)
 async function fetchWalletPositions(address) {
-  const posMap = new Map(); // conditionId → { cashPnl, realizedPnl } (aggregated across outcomes)
+  const posMap = new Map();
   try {
     const url = `${DATA_API}/positions?user=${address}&limit=500`;
     const data = await fetchJSON(url, 2, 1500);
@@ -661,11 +664,21 @@ async function fetchWalletPositions(address) {
       if (!cid) continue;
       const cashPnl     = parseFloat(p.cashPnl     ?? 0);
       const realizedPnl = parseFloat(p.realizedPnl ?? 0);
-      const existing    = posMap.get(cid);
+      const curPrice    = parseFloat(p.curPrice    ?? -1);
+      const size        = parseFloat(p.size        ?? 0);
+      const oi          = parseInt(p.outcomeIndex  ?? -1);
+
+      // cid-level: aggregate for realizedPnl win signal
+      const existing = posMap.get(cid);
       posMap.set(cid, {
         cashPnl:     (existing?.cashPnl     ?? 0) + cashPnl,
         realizedPnl: (existing?.realizedPnl ?? 0) + realizedPnl,
       });
+
+      // cid:outcomeIndex-level: per-outcome curPrice for loss signal
+      if (oi >= 0) {
+        posMap.set(`${cid}:${oi}`, { curPrice, realizedPnl, size });
+      }
     }
   } catch (_) {}
   return posMap;
@@ -807,7 +820,7 @@ function buildRedeemInfo(allTrades) {
 //
 // Paths ii and iii are symmetric: ii catches wins, iii catches losses.
 // Without iii, loss-exit markets are invisible and win rates are inflated.
-function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sellsByMarket) {
+function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sellsByMarket, posMap) {
   // Build per-conditionId: { avgBuyPrice, firstBuyTs } for loss-exit check
   const buysByMarket = new Map();
   for (const t of allTrades) {
@@ -908,6 +921,24 @@ function filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sells
       }
     }
 
+    // Senary: wallet holds a ZERO-VALUE position for this outcome (curPrice ≈ 0,
+    // realizedPnl = 0). Market resolved against the wallet and they never redeemed.
+    // These are the "silent losses" missed by all other paths — no REDEEM event,
+    // market not in gamma bulk scan. Only include if buy was within the last 90 days
+    // (scanner's lookback window) and the token is genuinely worthless (curPrice < 0.01).
+    if (posMap && buyTs > 0) {
+      const oi = parseInt(t.outcomeIndex ?? t.outcome_index ?? 0);
+      const posEntry = posMap.get(`${cid}:${oi}`);
+      if (posEntry &&
+          posEntry.curPrice >= 0 && posEntry.curPrice < 0.01 &&
+          posEntry.realizedPnl === 0 &&
+          posEntry.size > 0) {
+        const nowMs = Date.now();
+        // Within 90 days of buy (scanner's max lookback)
+        if (nowMs - buyTs <= 90 * 86400000) return true;
+      }
+    }
+
     return false;
   });
 }
@@ -957,6 +988,23 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     // which outcome the qualifying BUY was on vs which outcome won.
     const redeemHasMixed = !!(redeemEntry?.isWin && redeemEntry?.hasZeroRedeem);
 
+    // Determine walletOI early — needed for position-based loss detection below.
+    const outcomeCounts = {};
+    for (const t of trades) {
+      const oi = t.outcomeIndex ?? 0;
+      outcomeCounts[oi] = (outcomeCounts[oi] || 0) + 1;
+    }
+    const walletOI = parseInt(Object.entries(outcomeCounts).sort((a, b) => b[1] - a[1])[0][0]);
+
+    // Position-based loss signal: wallet holds a ZERO-VALUE position for this outcome.
+    // curPrice < 0.01 means the token is essentially worthless — market resolved against
+    // them and they never redeemed (no REDEEM event, silent loss).
+    const posOI = posMap ? posMap.get(`${cid}:${walletOI}`) : null;
+    const hasPosLoss = !!(posOI &&
+      posOI.curPrice >= 0 && posOI.curPrice < 0.01 &&
+      posOI.realizedPnl === 0 &&
+      posOI.size > 0);
+
     // Exit detection via SELL events: compare sell prices to avg buy price
     const avgBuyPrice  = trades.reduce((s, t) => s + parseFloat(t.price ?? 0), 0) / trades.length;
     const sellEntry    = sellsByMarket ? sellsByMarket.get(cid) : null;
@@ -967,7 +1015,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     // Only short-circuit on REDEEM signals when unambiguous (no mixed outcome).
     // Mixed → fall through to resolvedMarketMap to check qualifying BUY outcomeIndex.
     let isWin  = hasPosWin || (redeemIsWin && !redeemHasMixed) || profitableExit;
-    let isLoss = !isWin && (lossExit || (redeemEntry !== undefined && !redeemEntry.isWin && !redeemHasMixed));
+    let isLoss = !isWin && (lossExit || hasPosLoss || (redeemEntry !== undefined && !redeemEntry.isWin && !redeemHasMixed));
 
     if (!isWin && !isLoss) {
       // Try gamma resolvedMarketMap first (no API call, fast)
@@ -983,13 +1031,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
       }
 
       if (winnerOutcomeIndex !== undefined) {
-        // Find the wallet's dominant outcomeIndex across qualifying trades in this market
-        const outcomeCounts = {};
-        for (const t of trades) {
-          const oi = t.outcomeIndex ?? 0;
-          outcomeCounts[oi] = (outcomeCounts[oi] || 0) + 1;
-        }
-        const walletOI = parseInt(Object.entries(outcomeCounts).sort((a, b) => b[1] - a[1])[0][0]);
+        // walletOI already determined above
         if (walletOI === winnerOutcomeIndex) isWin = true;
         else isLoss = true;
       } else {
@@ -1286,7 +1328,7 @@ async function runScan() {
       await prefetchGammaOutcomes(allTrades, shortConditionIds, redeemByKey);
 
       // STEP 3: qualifying trades — most recent 30 only (newest-first order preserved)
-      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sellsByMarket);
+      const allQualifying = filterQualifyingTrades(allTrades, shortConditionIds, redeemByKey, sellsByMarket, posMap);
       if (!allQualifying.length) { skippedNoQualifying++; continue; }
       const qualifying = allQualifying.slice(0, 30);
 
