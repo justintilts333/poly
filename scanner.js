@@ -976,6 +976,7 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
   let totalInvested = 0;
   let openMarkets = 0;      // qualifying markets still open (excluded from win/loss)
   let lastResortLosses = 0; // losses assigned by last resort: expired/unknown end date + no profit
+  const perMarketOutcome = new Map(); // cid → 'win'|'loss' — reused by conviction gate, no extra API calls
 
   for (const [cid, trades] of byMarket) {
     const posData   = posMap ? posMap.get(cid) : null;
@@ -1066,6 +1067,8 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
 
     if (!isWin && !isLoss) continue; // open or truly unresolvable — excluded from win/loss
 
+    perMarketOutcome.set(cid, isWin ? 'win' : 'loss');
+
     // Use latest trade timestamp in this market for time-window bucketing
     let marketTs = 0;
     for (const t of trades) {
@@ -1151,6 +1154,104 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
     total7d, total30d,
     openMarkets,       // qualifying markets still open (excluded from win/loss counts)
     lastResortLosses,  // losses inferred by expiry/no-profit rule (no explicit resolution data)
+    perMarketOutcome,  // Map<cid, 'win'|'loss'> — passed to conviction gate
+  };
+}
+
+// ── Conviction win-rate gate ───────────────────────────────────────────────────
+// A conviction trade is any qualifying BUY with usdcSize ≥ 2× the wallet's median
+// buy size. Evaluated against the same capped-30 qualifying window as calcMetrics.
+// Rules:
+//   0 conviction trades in window       → fail
+//   1–2 resolved conviction trades      → pass (small sample, no penalty)
+//   3+ resolved conviction trades       → win rate ≥ 50% AND ≥ 3 distinct calendar weeks
+//
+// Uses perMarketOutcome from calcMetrics — no additional API calls.
+function calcConvictionGate(allTrades, qualifying, perMarketOutcome) {
+  // 1. Median buy size across ALL BUY trades (not just qualifying — represents true wallet baseline)
+  const buySizes = [];
+  for (const t of allTrades) {
+    const tType = (t.type || '').toUpperCase();
+    const side  = (t.side  || '').toUpperCase();
+    if (side !== 'BUY' && tType !== 'BUY') continue;
+    if (tType === 'REDEEM' || tType === 'SELL' || tType === 'MERGE') continue;
+    const sz = parseFloat(t.usdcSize ?? 0);
+    if (sz > 0) buySizes.push(sz);
+  }
+  if (!buySizes.length) return { pass: false, reason: 'no_buy_sizes' };
+  buySizes.sort((a, b) => a - b);
+  const mid = Math.floor(buySizes.length / 2);
+  const medianBuySize = buySizes.length % 2 === 0
+    ? (buySizes[mid - 1] + buySizes[mid]) / 2
+    : buySizes[mid];
+  const convictionThreshold = medianBuySize * 2;
+
+  // 2. Find conviction trades from the qualifying window (already price-filtered + short-resolution)
+  // Deduplicate by conditionId — one entry per market, consistent with calcMetrics.
+  const cutoff90d = Date.now() - 90 * 86400000;
+  const convictionByMarket = new Map(); // cid → earliest buy ts
+  for (const t of qualifying) {
+    const sz = parseFloat(t.usdcSize ?? 0);
+    if (sz < convictionThreshold) continue;
+    let ts = t.timestamp ?? 0;
+    if (typeof ts === 'string') ts = new Date(ts).getTime() || 0;
+    if (typeof ts === 'number' && ts > 0 && ts < 1e12) ts *= 1000;
+    if (ts > 0 && ts < cutoff90d) continue;
+    const cid = (t.conditionId || t.condition_id || '').toLowerCase();
+    if (!cid) continue;
+    const existing = convictionByMarket.get(cid);
+    if (!existing || (ts > 0 && ts < existing)) convictionByMarket.set(cid, ts || 0);
+  }
+
+  // 3. Zero conviction trades → fail
+  if (!convictionByMarket.size) {
+    return { pass: false, reason: 'no_conviction_trades', medianBuySize: medianBuySize.toFixed(2) };
+  }
+
+  // 4. Resolve outcomes via perMarketOutcome (populated by calcMetrics, no extra API calls)
+  let resolved = 0, wins = 0;
+  for (const cid of convictionByMarket.keys()) {
+    const outcome = perMarketOutcome.get(cid);
+    if (outcome === 'win')  { resolved++; wins++; }
+    else if (outcome === 'loss') { resolved++; }
+    // open or unresolvable: counted in total but not in resolved
+  }
+
+  // 5. 1–2 resolved → pass (small sample, no penalty)
+  if (resolved <= 2) {
+    return { pass: true, reason: 'small_sample', total: convictionByMarket.size, resolved, wins, medianBuySize: medianBuySize.toFixed(2) };
+  }
+
+  // 6. 3+ resolved: win rate must be ≥ 50%
+  const convictionWinRate = wins / resolved;
+  if (convictionWinRate < 0.50) {
+    return {
+      pass: false, reason: 'conviction_win_rate_below_50pct',
+      total: convictionByMarket.size, resolved, wins,
+      convictionWinRate: convictionWinRate.toFixed(3),
+      medianBuySize: medianBuySize.toFixed(2),
+    };
+  }
+
+  // 7. Conviction trades must span ≥ 3 distinct calendar weeks (consistency gate)
+  const weeks = new Set();
+  for (const ts of convictionByMarket.values()) {
+    if (ts > 0) weeks.add(Math.floor(ts / (7 * 86400000)));
+  }
+  if (weeks.size < 3) {
+    return {
+      pass: false, reason: 'conviction_insufficient_week_spread',
+      weekSpread: weeks.size, total: convictionByMarket.size, resolved, wins,
+      medianBuySize: medianBuySize.toFixed(2),
+    };
+  }
+
+  return {
+    pass: true, reason: 'passed',
+    total: convictionByMarket.size, resolved, wins,
+    convictionWinRate: convictionWinRate.toFixed(3),
+    weekSpread: weeks.size,
+    medianBuySize: medianBuySize.toFixed(2),
   };
 }
 
@@ -1228,7 +1329,7 @@ async function runScan() {
   let segment1, shortConditionIds, resolvedMarketMap, allWallets, startIndex;
   let tierS, tier1, tier2, tier3, tier4, seen;
   let processed, skippedBot, skippedActivity, skippedNoTrades,
-      skippedNoQualifying, skippedNoResolved, skippedNoTier;
+      skippedNoQualifying, skippedNoResolved, skippedConviction, skippedNoTier;
 
   if (ckpt) {
     log(`Resuming from checkpoint: wallet ${ckpt.startIndex}/${ckpt.wallets.length} (${ckpt.wallets.length - ckpt.startIndex} remaining)`);
@@ -1244,7 +1345,7 @@ async function runScan() {
     tier4             = ckpt.tier4 || [];
     seen              = new Map(ckpt.seen);
     ({ processed, skippedBot, skippedActivity, skippedNoTrades,
-       skippedNoQualifying, skippedNoResolved, skippedNoTier } = ckpt.stats);
+       skippedNoQualifying, skippedNoResolved, skippedConviction = 0, skippedNoTier } = ckpt.stats);
     // Restore agent 574 cache
     for (const [k, v] of (ckpt.marketOutcomeCache || [])) marketOutcomeCache.set(k, v);
   } else {
@@ -1272,7 +1373,7 @@ async function runScan() {
     tierS = []; tier1 = []; tier2 = []; tier3 = []; tier4 = [];
     seen  = new Map();
     processed = 0; skippedBot = 0; skippedActivity = 0; skippedNoTrades = 0;
-    skippedNoQualifying = 0; skippedNoResolved = 0; skippedNoTier = 0;
+    skippedNoQualifying = 0; skippedNoResolved = 0; skippedConviction = 0; skippedNoTier = 0;
     log(`Segment 2 candidates: ${allWallets.length} (prescored market traders)`);
   }
 
@@ -1285,7 +1386,7 @@ async function runScan() {
     processed++;
     if (processed % 50 === 0) {
       const lrTotal = [...seen.values()].reduce((s, r) => s + (r.lastResortLosses || 0), 0);
-      log(`Progress: ${processed}/${allWallets.length} | S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} | bot=${skippedBot} inactive=${skippedActivity} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier} | lastResort=${lrTotal}`);
+      log(`Progress: ${processed}/${allWallets.length} | S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} | bot=${skippedBot} inactive=${skippedActivity} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} conviction=${skippedConviction} noTier=${skippedNoTier} | lastResort=${lrTotal}`);
     }
 
     // Save checkpoint every 200 wallets
@@ -1298,7 +1399,7 @@ async function runScan() {
         resolvedMarketMap: [...resolvedMarketMap],
         tierS, tier1, tier2, tier3, tier4,
         seen:              [...seen],
-        stats:             { processed, skippedBot, skippedActivity, skippedNoTrades, skippedNoQualifying, skippedNoResolved, skippedNoTier },
+        stats:             { processed, skippedBot, skippedActivity, skippedNoTrades, skippedNoQualifying, skippedNoResolved, skippedConviction, skippedNoTier },
         marketOutcomeCache: [...marketOutcomeCache],
       });
     }
@@ -1335,6 +1436,11 @@ async function runScan() {
       // STEP 4: metrics (uses posMap + gamma resolvedMarketMap + agent 574 for true win/loss)
       const m = await calcMetrics(qualifying, allTrades, redeemByKey, resolvedCids, posMap, resolvedMarketMap, sellsByMarket);
       if (!m) { skippedNoResolved++; continue; }
+
+      // STEP 4b: conviction win-rate gate
+      // Reuses m.perMarketOutcome — no additional API calls.
+      const convGate = calcConvictionGate(allTrades, qualifying, m.perMarketOutcome);
+      if (!convGate.pass) { skippedConviction++; continue; }
 
       const tiers = assignTiers(m);
       if (!tiers.length) { skippedNoTier++; continue; }
@@ -1432,6 +1538,7 @@ async function runScan() {
         skippedNoTrades,
         skippedNoQualifying,
         skippedNoResolved,
+        skippedConviction,
         skippedNoTier,
         tierSCount:     tierS.length,
         tier1Count:     tier1.length,
@@ -1450,7 +1557,7 @@ async function runScan() {
   log(`=== Scan complete ===`);
   log(`  Segment 1 (Falcon): ${segment1.length} wallets`);
   log(`  Segment 2 (own criteria): S=${tierS.length} T1=${tier1.length} T2=${tier2.length} T3=${tier3.length} T4=${tier4.length} Multi=${multiTier.length}`);
-  log(`  Segment 2 skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} noTier=${skippedNoTier}`);
+  log(`  Segment 2 skipped: bot=${skippedBot} inactive=${skippedActivity} noTrades=${skippedNoTrades} noQual=${skippedNoQualifying} noResolved=${skippedNoResolved} conviction=${skippedConviction} noTier=${skippedNoTier}`);
   return results;
 }
 

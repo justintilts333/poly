@@ -147,8 +147,10 @@ function defaultState() {
       TOP5_PNL: { walletsMonitored: 0, tradesDetected: 0, tradesMirrored: 0, openCount: 0 },
       FALCON:   { walletsMonitored: 0, tradesDetected: 0, tradesMirrored: 0, openCount: 0 },
     },
-    monitoredWallets: [],  // { address, source, score, winRate, overallPnl, lastSeen }
-    lastWalletCheck:  {},  // address → timestamp ms
+    monitoredWallets:  [],  // { address, source, score, winRate, overallPnl, lastSeen }
+    lastWalletCheck:   {},  // address → timestamp ms
+    signalPerformance: {},  // fullAddress → { resolved, dollarsWon, dollarsLost }
+    droppedWallets:    [],  // full addresses dropped mid-cycle (excluded until next re-seed)
   };
 }
 
@@ -163,7 +165,9 @@ function loadState() {
       return {
         ...def,
         ...raw,
-        buckets: { ...def.buckets, ...(raw.buckets || {}) },
+        buckets:           { ...def.buckets, ...(raw.buckets || {}) },
+        signalPerformance: raw.signalPerformance || {},
+        droppedWallets:    raw.droppedWallets    || [],
       };
     }
   } catch (_) {}
@@ -295,8 +299,9 @@ async function mirrorTrade({ sourceAddress, source, conditionId, outcomeIndex, e
   }
 
   const posEntry = {
-    id:        tradeEntry.id,
-    address:   tradeEntry.sourceAddress,
+    id:          tradeEntry.id,
+    address:     tradeEntry.sourceAddress,  // truncated display label
+    fullAddress: sourceAddress,             // full address — needed for resolution API calls
     source,
     conditionId,
     outcomeIndex,
@@ -320,10 +325,128 @@ async function mirrorTrade({ sourceAddress, source, conditionId, outcomeIndex, e
   saveState();
 }
 
+// ── Source wallet positions (for signal resolution) ────────────────────────────
+// Returns Map of "conditionId:outcomeIndex" → curPrice
+async function fetchSourcePositions(address) {
+  const posMap = new Map();
+  try {
+    const data = await fetchJSON(`${DATA_API}/positions?user=${address}&limit=500`);
+    const rows = Array.isArray(data) ? data : (data.data || data.positions || []);
+    for (const p of rows) {
+      const cid = (p.conditionId || p.condition_id || '').toLowerCase();
+      const oi  = parseInt(p.outcomeIndex ?? -1);
+      if (!cid || oi < 0) continue;
+      posMap.set(`${cid}:${oi}`, parseFloat(p.curPrice ?? -1));
+    }
+  } catch (_) {}
+  return posMap;
+}
+
+// ── Mid-cycle drop check ───────────────────────────────────────────────────────
+// Called after each signal resolves for a given source wallet.
+// Removes the wallet from active monitoring when live signal P&L turns negative.
+function checkMidCycleDrop(address, monitoredMap) {
+  const perf = state.signalPerformance[address];
+  if (!perf || perf.resolved < 5) return;
+  if (perf.dollarsLost <= perf.dollarsWon) return;
+
+  const threshold = perf.resolved >= 10 ? '10+' : '5+';
+  log(
+    `DROP [mid_cycle] ${address.slice(0, 10)} | reason=mid_cycle_negative_signal_performance` +
+    ` | threshold=${threshold} resolved=${perf.resolved}` +
+    ` | won=$${perf.dollarsWon.toFixed(2)} lost=$${perf.dollarsLost.toFixed(2)}`
+  );
+
+  state.droppedWallets.push(address);
+  monitoredMap.delete(address);
+  monitoredAddressSet.delete(address);
+  state.monitoredWallets = state.monitoredWallets.filter(w => w.address !== address);
+  saveState();
+}
+
+// ── Open position resolution ───────────────────────────────────────────────────
+// Periodically fetches source wallet positions to detect market resolution.
+// curPrice ≥ 0.95 → WIN (token worth ~$1), curPrice < 0.05 → LOSS (token worthless).
+// Updates signalPerformance per wallet and fires checkMidCycleDrop after each resolve.
+async function resolveOpenPositions(monitoredMap) {
+  if (!state.openPositions?.length) return;
+
+  // Group by source wallet (fullAddress stored at copy time)
+  const byWallet = new Map();
+  for (const pos of state.openPositions) {
+    if (!pos.fullAddress) continue;
+    if (!byWallet.has(pos.fullAddress)) byWallet.set(pos.fullAddress, []);
+    byWallet.get(pos.fullAddress).push(pos);
+  }
+  if (!byWallet.size) return;
+
+  log(`Resolving open positions: ${state.openPositions.length} positions across ${byWallet.size} wallets`);
+
+  const resolvedIds = new Set();
+
+  for (const [walletAddr, positions] of byWallet) {
+    const sourcePos = await fetchSourcePositions(walletAddr);
+    await sleep(300);
+
+    for (const pos of positions) {
+      const key      = `${pos.conditionId}:${pos.outcomeIndex}`;
+      const curPrice = sourcePos.get(key);
+      if (curPrice === undefined || curPrice < 0) continue; // not found or API gap
+
+      const isWin  = curPrice >= 0.95;
+      const isLoss = curPrice < 0.05;
+      if (!isWin && !isLoss) continue; // still live
+
+      resolvedIds.add(pos.id);
+
+      // P&L on our mirrored position: win = profit only; loss = full stake
+      const dollarsWon  = isWin  ? +(pos.size * (1 / Math.max(pos.entryPrice, 0.001) - 1)).toFixed(2) : 0;
+      const dollarsLost = isLoss ? pos.size : 0;
+
+      // Update trade log entry
+      const logEntry = state.tradeLog.find(t => t.id === pos.id);
+      if (logEntry) {
+        logEntry.result     = isWin ? 'WIN' : 'LOSS';
+        logEntry.resolvedAt = new Date().toISOString();
+        logEntry.pnl        = isWin ? dollarsWon : -dollarsLost;
+      }
+
+      log(
+        `RESOLVED [${pos.source}] ${walletAddr.slice(0, 10)}` +
+        ` market=${pos.conditionId.slice(0, 10)} outcome=${isWin ? 'WIN' : 'LOSS'}` +
+        ` won=$${dollarsWon.toFixed(2)} lost=$${dollarsLost.toFixed(2)}`
+      );
+
+      // Per-wallet signal performance
+      if (!state.signalPerformance[walletAddr]) {
+        state.signalPerformance[walletAddr] = { resolved: 0, dollarsWon: 0, dollarsLost: 0 };
+      }
+      const perf = state.signalPerformance[walletAddr];
+      perf.resolved++;
+      perf.dollarsWon  += dollarsWon;
+      perf.dollarsLost += dollarsLost;
+
+      checkMidCycleDrop(walletAddr, monitoredMap);
+    }
+  }
+
+  if (resolvedIds.size > 0) {
+    state.openPositions = state.openPositions.filter(p => !resolvedIds.has(p.id));
+    for (const cat of ['S_TIER', 'TOP5_PNL', 'FALCON']) {
+      if (state.buckets[cat]) {
+        state.buckets[cat].openCount = state.openPositions.filter(p => p.source === cat).length;
+      }
+    }
+    log(`Closed ${resolvedIds.size} positions, ${state.openPositions.length} remaining open`);
+    saveState();
+  }
+}
+
 // ── Activity check per wallet ──────────────────────────────────────────────────
 const knownLatestTs = new Map(); // address → last trade ts seen
 
 async function checkWallet(address, info) {
+  if (state.droppedWallets.includes(address)) return; // mid-cycle drop applied
   try {
     const url = `${DATA_API}/activity?user=${address}&limit=20&sortBy=TIMESTAMP&ascending=false`;
     const data = await fetchJSON(url, 2, 2000);
@@ -537,9 +660,14 @@ async function main() {
 
   connectWebSocket(monitoredMap);
 
-  // Poll loop
+  // Poll loop — resolves open positions every ~10 minutes (every 20 ticks × 30s)
+  let resolveTick = 0;
   while (true) {
     try { await pollCycle(monitoredMap); } catch (e) { logError('Poll cycle', e); }
+    resolveTick++;
+    if (resolveTick % 20 === 0) {
+      try { await resolveOpenPositions(monitoredMap); } catch (e) { logError('resolveOpenPositions', e); }
+    }
     await sleep(30000);
   }
 }
