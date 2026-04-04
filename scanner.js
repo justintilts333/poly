@@ -1163,8 +1163,8 @@ async function calcMetrics(qualifyingTrades, allTrades, redeemByKey, resolvedCid
 // buy size. Evaluated against the same capped-30 qualifying window as calcMetrics.
 // Rules:
 //   0 conviction trades in window       → fail
-//   1–2 resolved conviction trades      → pass (small sample, no penalty)
-//   3+ resolved conviction trades       → win rate ≥ 50% AND ≥ 3 distinct calendar weeks
+//   1–4 resolved conviction trades      → pass (small sample, no penalty)
+//   5+ resolved conviction trades       → win rate ≥ 50%
 //
 // Uses perMarketOutcome from calcMetrics — no additional API calls.
 function calcConvictionGate(allTrades, qualifying, perMarketOutcome) {
@@ -1217,12 +1217,12 @@ function calcConvictionGate(allTrades, qualifying, perMarketOutcome) {
     // open or unresolvable: counted in total but not in resolved
   }
 
-  // 5. 1–2 resolved → pass (small sample, no penalty)
-  if (resolved <= 2) {
+  // 5. ≤4 resolved → pass (small sample, no penalty)
+  if (resolved <= 4) {
     return { pass: true, reason: 'small_sample', total: convictionByMarket.size, resolved, wins, medianBuySize: medianBuySize.toFixed(2) };
   }
 
-  // 6. 3+ resolved: win rate must be ≥ 50%
+  // 6. 5+ resolved: win rate must be ≥ 50%
   const convictionWinRate = wins / resolved;
   if (convictionWinRate < 0.50) {
     return {
@@ -1233,24 +1233,10 @@ function calcConvictionGate(allTrades, qualifying, perMarketOutcome) {
     };
   }
 
-  // 7. Conviction trades must span ≥ 3 distinct calendar weeks (consistency gate)
-  const weeks = new Set();
-  for (const ts of convictionByMarket.values()) {
-    if (ts > 0) weeks.add(Math.floor(ts / (7 * 86400000)));
-  }
-  if (weeks.size < 3) {
-    return {
-      pass: false, reason: 'conviction_insufficient_week_spread',
-      weekSpread: weeks.size, total: convictionByMarket.size, resolved, wins,
-      medianBuySize: medianBuySize.toFixed(2),
-    };
-  }
-
   return {
     pass: true, reason: 'passed',
     total: convictionByMarket.size, resolved, wins,
     convictionWinRate: convictionWinRate.toFixed(3),
-    weekSpread: weeks.size,
     medianBuySize: medianBuySize.toFixed(2),
   };
 }
