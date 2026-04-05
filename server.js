@@ -131,11 +131,13 @@ function buildTableRows(wallets, execData) {
       T.sigTotal += sigTotal ?? 0;
     }
 
-    // 30d columns
-    const wins30  = w.wins30d    ?? null;
-    const loss30  = w.losses30d  ?? null;
-    const net30   = w.pnl30d     ?? null;
-    const staked30= w.staked30d  ?? null;
+    // 30d columns — scanner stores total30dMarkets + winRate30d, not wins30d/losses30d separately
+    const _total30 = w.total30dMarkets ?? null;
+    const _wr30    = w.winRate30d;
+    const wins30  = w.wins30d   ?? (_total30 != null && !isNaN(_wr30) ? Math.round(_wr30 * _total30) : null);
+    const loss30  = w.losses30d ?? (_total30 != null && wins30 != null ? _total30 - wins30 : null);
+    const net30   = w.pnl30d    ?? null;
+    const staked30= w.staked30d ?? w.invested30d ?? null;
     const roi30   = roiFmt(net30, staked30);
     if (wins30  != null) T.wins30   += wins30;
     if (loss30  != null) T.loss30   += loss30;
@@ -149,8 +151,8 @@ function buildTableRows(wallets, execData) {
     const atWins  = w.wins       ?? null;
     const atLoss  = w.losses     ?? null;
     const atNet   = w.overallPnl ?? null;
-    const atStaked= w.totalStaked ?? null;
-    const atRoi   = roiFmt(atNet, atStaked);
+    const atStaked= w.totalStaked ?? w.totalInvested ?? null;
+    const atRoi   = w.roi != null ? `${w.roi >= 0 ? '+' : ''}${(w.roi * 100).toFixed(1)}%` : roiFmt(atNet, atStaked);
     if (atWins  != null) T.atWins   += atWins;
     if (atLoss  != null) T.atLoss   += atLoss;
     if (atNet   != null) T.atNet    += atNet;
@@ -371,13 +373,14 @@ function buildPage(results, execStatus) {
   const scanTime = results
     ? new Date(results.scanTime).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
     : 'No scan data';
-  const stats = results?.stats || {};
+  const seg2  = results?.segment2 || {};
+  const stats = seg2.stats || results?.stats || {};
 
-  const tierSRows  = buildTableRows(results?.segment2?.tierS ?? results?.tierS, execStatus);
-  const tier1Rows  = buildTableRows(results?.tier1, execStatus);
-  const tier2Rows  = buildTableRows(results?.tier2, execStatus);
-  const tier3Rows  = buildTableRows(results?.tier3, execStatus);
-  const multiRows  = buildTableRows(results?.multiTier, execStatus);
+  const tierSRows  = buildTableRows(seg2.tierS   ?? results?.tierS,   execStatus);
+  const tier1Rows  = buildTableRows(seg2.tier1   ?? results?.tier1,   execStatus);
+  const tier2Rows  = buildTableRows(seg2.tier2   ?? results?.tier2,   execStatus);
+  const tier3Rows  = buildTableRows(seg2.tier3   ?? results?.tier3,   execStatus);
+  const multiRows  = buildTableRows(seg2.multiTier ?? results?.multiTier, execStatus);
 
   const th = (label) => `<th onclick="sortTable(this)" style="cursor:pointer;user-select:none">${label} <span class="sort-arrow"></span></th>`;
   const tableHeaders = `
