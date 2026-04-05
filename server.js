@@ -444,6 +444,146 @@ function buildPaperTradesPanel(exec) {
     </div>`;
 }
 
+function buildCurrentTradersTab(exec, results) {
+  if (!exec) {
+    return `<div class="exec-offline"><p>Executor is <strong>offline</strong>. No current traders to display.</p></div>`;
+  }
+
+  // Build address → scanner wallet data map across all tiers
+  const seg2 = results?.segment2 || {};
+  const allTierWallets = [
+    ...(seg2.tierS || []), ...(seg2.tier1 || []), ...(seg2.tier2 || []),
+    ...(seg2.tier3 || []), ...(seg2.tier4 || []),
+    ...(results?.tierS || []), ...(results?.tier1 || []),
+    ...(results?.tier2 || []), ...(results?.tier3 || []),
+  ];
+  const scannerMap = {};
+  for (const w of allTierWallets) {
+    if (w.address) scannerMap[w.address.toLowerCase()] = w;
+  }
+
+  const monWallets = exec.monitoredWallets || [];
+  const sigPerf = exec.signalPerformance || {};
+  const openPositions = exec.openPositions || [];
+  const droppedWallets = exec.droppedWallets || [];
+
+  const openByWallet = {};
+  for (const p of openPositions) {
+    const key = (p.sourceAddress || '').toLowerCase();
+    if (!key) continue;
+    openByWallet[key] = (openByWallet[key] || 0) + (parseFloat(p.size) || 0);
+  }
+
+  if (monWallets.length === 0) {
+    return `<div class="exec-offline"><p>No wallets currently being monitored by the executor.</p></div>`;
+  }
+
+  const th = (label) => `<th onclick="sortTable(this)" style="cursor:pointer;user-select:none">${label} <span class="sort-arrow"></span></th>`;
+  const dv = (v) => v != null && !isNaN(v) ? ` data-val="${v}"` : ' data-val=""';
+  const fmtSig = (v) => v == null ? '<span style="color:#6e7681">—</span>' : `$${fmt(v)}`;
+  const fmtN   = (v) => v == null ? '<span style="color:#6e7681">—</span>' : v;
+  const dash   = '<span style="color:#6e7681">—</span>';
+
+  const rows = monWallets.map((w, idx) => {
+    const addrKey = (w.address || '').toLowerCase();
+    const profileUrl = `https://polymarket.com/profile/${w.address || ''}`;
+
+    const rankBadge = idx === 0 ? '<span class="rank gold">#1</span>'
+      : idx === 1 ? '<span class="rank silver">#2</span>'
+      : idx === 2 ? '<span class="rank bronze">#3</span>'
+      : `<span class="rank">#${idx + 1}</span>`;
+
+    const isDropped = droppedWallets.map(a => a.toLowerCase()).includes(addrKey);
+    const statusBadge = isDropped
+      ? '<span style="color:#f85149;font-size:0.75rem;font-weight:600">DROPPED</span>'
+      : '<span style="color:#3fb950;font-size:0.75rem;font-weight:600">ACTIVE</span>';
+
+    const catColor = w.source === 'S_TIER' ? '#ffd700' : w.source === 'TOP5_PNL' ? '#3fb950' : '#a371f7';
+    const catLabel = w.source === 'S_TIER' ? 'S-Tier' : w.source === 'TOP5_PNL' ? 'Top5PnL' : 'Falcon';
+
+    // All-time sig data from executor
+    const sp       = sigPerf[addrKey] || sigPerf[w.address] || null;
+    const sigWon   = sp?.dollarsWon  ?? null;
+    const sigLost  = sp?.dollarsLost ?? null;
+    const sigNet   = (sigWon != null && sigLost != null) ? sigWon - sigLost : null;
+    const sigOpen  = openByWallet[addrKey] ?? null;
+    const sigStaked= sp?.totalStaked ?? (sigWon != null && sigLost != null ? sigWon + sigLost : null);
+    const sigRoi   = roiFmt(sigNet, sigStaked);
+    const sig7dCnt = sp?.sigs7d ?? null;
+
+    // Scanner data for 7d / 30d
+    const sw = scannerMap[addrKey] || null;
+
+    const net7d    = sw?.pnl7d    ?? null;
+    const staked7d = sw?.staked7d ?? sw?.invested7d ?? null;
+    const wins7d   = sw?.wins7d   ?? null;
+    const loss7d   = sw?.losses7d ?? null;
+    const tot7d    = sw?.total7dMarkets ?? null;
+    const roi7d    = roiFmt(net7d, staked7d);
+
+    const _total30 = sw?.total30dMarkets ?? null;
+    const _wr30    = sw?.winRate30d;
+    const wins30   = sw?.wins30d   ?? (_total30 != null && !isNaN(_wr30) ? Math.round(_wr30 * _total30) : null);
+    const loss30   = sw?.losses30d ?? (_total30 != null && wins30 != null ? _total30 - wins30 : null);
+    const net30    = sw?.pnl30d    ?? null;
+    const staked30 = sw?.staked30d ?? sw?.invested30d ?? null;
+    const roi30    = roiFmt(net30, staked30);
+
+    const sigRoiClass = sigRoi === 'N/A' ? '' : (parseFloat(sigRoi) >= 0 ? 'pos' : 'neg');
+    const roi7dClass  = roi7d  === 'N/A' ? '' : (parseFloat(roi7d)  >= 0 ? 'pos' : 'neg');
+    const roi30Class  = roi30  === 'N/A' ? '' : (parseFloat(roi30)  >= 0 ? 'pos' : 'neg');
+
+    return `
+      <tr>
+        <td${dv(idx + 1)}>${rankBadge}</td>
+        <td data-val="${w.address || ''}"><a href="${profileUrl}" target="_blank" rel="noopener" class="mono">${shortAddr(w.address || '')}</a></td>
+        <td data-val="${w.source || ''}"><span style="color:${catColor};font-weight:600;font-size:0.78rem">${catLabel}</span></td>
+        <td data-val="${isDropped ? 0 : 1}">${statusBadge}</td>
+        <td class="${pnlClass(sigNet)}"${dv(sigNet)}>${sigNet != null ? pnlFmt(sigNet) : dash}</td>
+        <td class="${sigRoiClass}" data-val="${sigRoi === 'N/A' ? '' : parseFloat(sigRoi)}">${sigRoi}</td>
+        <td${dv(sigStaked)}>${fmtSig(sigStaked)}</td>
+        <td${dv(sig7dCnt)}>${fmtN(sig7dCnt)}</td>
+        <td class="${sigWon != null ? 'pos' : ''}"${dv(sigWon)}>${fmtSig(sigWon)}</td>
+        <td class="${sigLost != null ? 'neg' : ''}"${dv(sigLost != null ? -sigLost : null)}>${fmtSig(sigLost != null ? -sigLost : null)}</td>
+        <td${dv(sigOpen)}>${fmtSig(sigOpen)}</td>
+        <td class="${pnlClass(net7d)}"${dv(net7d)}>${net7d != null ? pnlFmt(net7d) : dash}</td>
+        <td class="${roi7dClass}" data-val="${roi7d === 'N/A' ? '' : parseFloat(roi7d)}">${roi7d}</td>
+        <td${dv(staked7d)}>${fmtSig(staked7d)}</td>
+        <td${dv(tot7d)}>${fmtN(tot7d)}</td>
+        <td${dv(wins7d)}>${fmtN(wins7d)}</td>
+        <td${dv(loss7d)}>${fmtN(loss7d)}</td>
+        <td data-val="">—</td>
+        <td class="${pnlClass(net30)}"${dv(net30)}>${net30 != null ? pnlFmt(net30) : dash}</td>
+        <td class="${roi30Class}" data-val="${roi30 === 'N/A' ? '' : parseFloat(roi30)}">${roi30}</td>
+        <td${dv(staked30)}>${fmtSig(staked30)}</td>
+        <td${dv(_total30)}>${fmtN(_total30)}</td>
+        <td${dv(wins30)}>${fmtN(wins30)}</td>
+        <td${dv(loss30)}>${fmtN(loss30)}</td>
+        <td data-val="">—</td>
+      </tr>`;
+  });
+
+  const tableHeaders = `
+    <tr>
+      ${th('Rank')}${th('Wallet')}${th('Source')}${th('Status')}
+      ${th('Sig Net $')}${th('Sig ROI %')}${th('Sig Staked $')}${th('My 7d Sigs')}${th('Sig Win $')}${th('Sig Loss $')}${th('Sig Open $')}
+      ${th('7d Net')}${th('7d ROI %')}${th('7d Staked')}${th('7d Sigs')}${th('7d Win')}${th('7d Loss')}${th('7d Open')}
+      ${th('30d Net')}${th('30d ROI %')}${th('30d Staked')}${th('30d Sigs')}${th('30d Win')}${th('30d Loss')}${th('30d Open')}
+    </tr>`;
+
+  return `
+    <div class="ct-header">
+      <span class="ct-title">Current Traders</span>
+      <span class="ct-meta">${monWallets.length} wallets monitored · ${openPositions.length} open positions</span>
+    </div>
+    <div class="table-wrap" style="margin-top:16px">
+      <table>
+        <thead>${tableHeaders}</thead>
+        <tbody>${rows.join('')}</tbody>
+      </table>
+    </div>`;
+}
+
 function buildPage(results, execStatus) {
   const scanTime = results
     ? new Date(results.scanTime).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
@@ -582,6 +722,10 @@ function buildPage(results, execStatus) {
     th[data-dir="asc"]  .sort-arrow::after { content: '↑'; color: #58a6ff; }
     th[data-dir="desc"] .sort-arrow::after { content: '↓'; color: #58a6ff; }
     tr.totals-row td { color: #c9d1d9; }
+    /* Current Traders tab */
+    .ct-header { display: flex; align-items: center; gap: 16px; margin-bottom: 4px; flex-wrap: wrap; }
+    .ct-title { font-size: 1.1rem; font-weight: 700; color: #c9d1d9; }
+    .ct-meta { font-size: 0.82rem; color: #8b949e; }
   </style>
 </head>
 <body>
@@ -591,6 +735,7 @@ function buildPage(results, execStatus) {
   <div class="tabs">
     <button class="tab-btn active" onclick="switchTab('scanner', this)">Scanner</button>
     <button class="tab-btn" onclick="switchTab('execution', this)">Execution</button>
+    <button class="tab-btn" onclick="switchTab('current-traders', this)">Current Traders</button>
   </div>
 
   <div id="tab-scanner" class="tab-panel active">
@@ -675,6 +820,10 @@ function buildPage(results, execStatus) {
 
   <div id="tab-execution" class="tab-panel">
     ${buildExecutionTab(execStatus)}
+  </div>
+
+  <div id="tab-current-traders" class="tab-panel">
+    ${buildCurrentTradersTab(execStatus, results)}
   </div>
 
   <script>
