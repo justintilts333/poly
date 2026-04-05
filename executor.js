@@ -72,14 +72,14 @@ const STATE_FILE   = path.join(__dirname, 'data', 'executor-state.json');
 const RESULTS_FILE = path.join(__dirname, 'data', 'results.json');
 
 // ── Logging ────────────────────────────────────────────────────────────────────
-const LOG_FILE = '/var/log/polymarket-scanner.log';
+const LOG_FILE = '/var/log/polymarket-executor.log';
 function log(msg) {
-  const line = `[${new Date().toISOString()}] [EXECUTOR] ${msg}\n`;
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
   process.stdout.write(line);
   try { fs.appendFileSync(LOG_FILE, line); } catch (_) {}
 }
 function logError(msg, err) {
-  const line = `[${new Date().toISOString()}] [EXECUTOR] ERROR: ${msg}${err ? ' | ' + (err.message || err) : ''}\n`;
+  const line = `[${new Date().toISOString()}] ERROR: ${msg}${err ? ' | ' + (err.message || err) : ''}\n`;
   process.stderr.write(line);
   try { fs.appendFileSync(LOG_FILE, line); } catch (_) {}
 }

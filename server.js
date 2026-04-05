@@ -369,6 +369,81 @@ function buildExecutionTab(exec) {
   return statusSection + catSection + posSection + tradeSection + walletSection;
 }
 
+function buildPaperTradesPanel(exec) {
+  if (!exec) {
+    return `<div class="paper-offline">Paper trading offline — executor not running.</div>`;
+  }
+
+  const positions = exec.openPositions || [];
+  const trades    = (exec.tradeLog || []).slice(0, 20);
+  const mode      = exec.botEnabled ? '<span class="badge-live">LIVE</span>' : '<span class="badge-sim">PAPER</span>';
+
+  const openRows = positions.length === 0
+    ? '<tr><td colspan="7" class="empty">No open positions</td></tr>'
+    : positions.map(p => {
+        const age = p.entryTime
+          ? Math.round((Date.now() - new Date(p.entryTime)) / 3600000) + 'h ago'
+          : '—';
+        const srcColor = p.source === 'S_TIER' ? '#ffd700' : p.source === 'TOP5_PNL' ? '#3fb950' : '#a371f7';
+        const srcLabel = p.source === 'S_TIER' ? 'S-Tier' : p.source === 'TOP5_PNL' ? 'Top5' : 'Falcon';
+        return `<tr>
+          <td style="color:${srcColor};font-weight:600;font-size:0.75rem">${srcLabel}</td>
+          <td class="mono"><a href="https://polymarket.com/profile/${p.fullAddress || ''}" target="_blank" rel="noopener">${(p.address || '').slice(0,10)}</a></td>
+          <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.question || ''}">${(p.question || p.conditionId || '').slice(0, 35)}</td>
+          <td>$${fmt(p.entryPrice, 3)}</td>
+          <td>$${fmt(p.size)}</td>
+          <td>${age}</td>
+          <td><span style="color:#e3b341">OPEN</span></td>
+        </tr>`;
+      }).join('');
+
+  const logRows = trades.length === 0
+    ? '<tr><td colspan="7" class="empty">No trades yet</td></tr>'
+    : trades.map(t => {
+        const resColor = t.result === 'WIN' ? '#3fb950' : t.result === 'LOSS' ? '#f85149' : '#8b949e';
+        const pnlStr   = t.pnl != null ? (t.pnl >= 0 ? `+$${t.pnl.toFixed(2)}` : `-$${Math.abs(t.pnl).toFixed(2)}`) : '—';
+        const srcColor = t.source === 'S_TIER' ? '#ffd700' : t.source === 'TOP5_PNL' ? '#3fb950' : '#a371f7';
+        const srcLabel = t.source === 'S_TIER' ? 'S-Tier' : t.source === 'TOP5_PNL' ? 'Top5' : 'Falcon';
+        return `<tr>
+          <td style="color:${srcColor};font-weight:600;font-size:0.75rem">${srcLabel}</td>
+          <td class="mono">${(t.sourceAddress || '').slice(0,10)}</td>
+          <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.question || ''}">${(t.question || t.conditionId || '').slice(0, 35)}</td>
+          <td>$${fmt(t.entryPrice, 3)}</td>
+          <td>$${fmt(t.size)}</td>
+          <td style="color:${resColor};font-weight:600">${t.result || 'OPEN'}</td>
+          <td class="${t.pnl != null ? (t.pnl >= 0 ? 'pos' : 'neg') : ''}">${pnlStr}</td>
+        </tr>`;
+      }).join('');
+
+  return `
+    <div class="paper-panel">
+      <div class="paper-header">
+        <span class="paper-title">Paper Trades ${mode}</span>
+        <span class="paper-meta">${positions.length} open · ${exec.dailyStats?.tradeCount ?? 0} today · Daily PnL: <span class="${pnlClass(exec.dailyStats?.dailyPnl)}">${pnlFmt(exec.dailyStats?.dailyPnl ?? 0)}</span></span>
+      </div>
+      <div class="paper-cols">
+        <div class="paper-col">
+          <div class="paper-col-title">Open Positions (${positions.length})</div>
+          <div class="table-wrap">
+            <table style="min-width:500px">
+              <thead><tr><th>Source</th><th>Wallet</th><th>Market</th><th>Entry</th><th>Size</th><th>Age</th><th>Status</th></tr></thead>
+              <tbody>${openRows}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="paper-col">
+          <div class="paper-col-title">Recent Trades (last ${trades.length})</div>
+          <div class="table-wrap">
+            <table style="min-width:500px">
+              <thead><tr><th>Source</th><th>Wallet</th><th>Market</th><th>Entry</th><th>Size</th><th>Result</th><th>PnL</th></tr></thead>
+              <tbody>${logRows}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 function buildPage(results, execStatus) {
   const scanTime = results
     ? new Date(results.scanTime).toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC'
@@ -492,6 +567,15 @@ function buildPage(results, execStatus) {
     .badge-sim-sm  { background: #1a1a2e; color: #a371f7; border-radius: 3px; padding: 1px 5px; font-size: 0.7rem; }
     .ws-ok  { color: #3fb950; font-size: 0.82rem; }
     .ws-off { color: #f85149; font-size: 0.82rem; }
+    /* Paper trades panel */
+    .paper-panel { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 28px; }
+    .paper-offline { color: #6e7681; font-size: 0.82rem; padding: 12px 0; margin-bottom: 28px; }
+    .paper-header { display: flex; align-items: center; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
+    .paper-title { font-size: 1rem; font-weight: 600; color: #c9d1d9; }
+    .paper-meta { font-size: 0.82rem; color: #8b949e; }
+    .paper-cols { display: flex; gap: 20px; flex-wrap: wrap; }
+    .paper-col { flex: 1; min-width: 300px; }
+    .paper-col-title { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
     th:hover { color: #c9d1d9; background: #1c2128; }
     th[data-dir] { color: #58a6ff; }
     .sort-arrow::after { content: '↕'; font-size: 0.65rem; color: #444d56; margin-left: 3px; }
@@ -526,6 +610,9 @@ function buildPage(results, execStatus) {
     <div class="stat-chip">Tier 3: <strong>${stats.tier3Count ?? 0}</strong></div>
     <div class="stat-chip">Multi-Tier: <strong>${stats.multiTierCount ?? 0}</strong></div>
   </div>
+
+  <!-- PAPER TRADES -->
+  ${buildPaperTradesPanel(execStatus)}
 
   <!-- S TIER -->
   <section class="stier">
