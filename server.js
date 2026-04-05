@@ -64,34 +64,96 @@ function shortAddr(addr) {
   return addr.slice(0, 6) + '…' + addr.slice(-4);
 }
 
-function buildTableRows(wallets) {
+function roiFmt(net, staked) {
+  if (net == null || staked == null || isNaN(net) || isNaN(staked) || staked === 0) return 'N/A';
+  const pct = (net / staked) * 100;
+  const sign = pct >= 0 ? '+' : '';
+  return `${sign}${pct.toFixed(1)}%`;
+}
+
+function buildTableRows(wallets, execData) {
+  const COL_COUNT = 21;
   if (!wallets || wallets.length === 0) {
-    return '<tr><td colspan="11" class="empty">No qualifying wallets found</td></tr>';
+    return `<tr><td colspan="${COL_COUNT}" class="empty">No qualifying wallets found</td></tr>`;
   }
+
+  const droppedWallets = execData?.droppedWallets || [];
+  const sigPerf = execData?.signalPerformance || {};
+  // Build per-wallet open position value from executor openPositions list
+  const openPositions = execData?.openPositions || [];
+  const openByWallet = {};
+  for (const p of openPositions) {
+    const key = (p.sourceAddress || '').toLowerCase();
+    if (!key) continue;
+    openByWallet[key] = (openByWallet[key] || 0) + (parseFloat(p.size) || 0);
+  }
+
   return wallets.map((w, idx) => {
     const profileUrl = `https://polymarket.com/profile/${w.address}`;
-    const tierBadges = (w.tiers || []).map(t =>
-      `<span class="badge t${t}">T${t}</span>`
-    ).join(' ');
+    const addrKey = (w.address || '').toLowerCase();
+
     const rankBadge = idx === 0 ? '<span class="rank gold">#1</span>'
       : idx === 1 ? '<span class="rank silver">#2</span>'
       : idx === 2 ? '<span class="rank bronze">#3</span>'
       : `<span class="rank">#${idx + 1}</span>`;
+
+    // Status
+    const isDropped = droppedWallets.map(a => a.toLowerCase()).includes(addrKey);
+    const statusBadge = isDropped
+      ? '<span style="color:#f85149;font-size:0.75rem;font-weight:600">DROPPED</span>'
+      : '<span style="color:#3fb950;font-size:0.75rem;font-weight:600">ACTIVE</span>';
+
+    // 30d columns
+    const wins30 = w.wins30d ?? 'N/A';
+    const loss30 = w.losses30d ?? 'N/A';
+    const net30  = w.pnl30d;
+    const staked30 = w.staked30d ?? null;
+    const roi30 = roiFmt(net30, staked30);
+
+    // All-time columns
+    const atWins = w.wins ?? 'N/A';
+    const atLoss = w.losses ?? 'N/A';
+    const atNet  = w.overallPnl;
+    const atStaked = w.totalStaked ?? null;
+    const atRoi  = roiFmt(atNet, atStaked);
+
+    // Sig columns from executor
+    const sp = sigPerf[addrKey] || sigPerf[w.address] || null;
+    const sigWon    = sp?.dollarsWon    ?? null;
+    const sigLost   = sp?.dollarsLost   ?? null;
+    const sigNet    = (sigWon != null && sigLost != null) ? sigWon - sigLost : null;
+    const sigOpen   = openByWallet[addrKey] ?? null;
+    const sigStaked = sp?.totalStaked   ?? (sigWon != null && sigLost != null ? sigWon + sigLost : null);
+    const sigRoi    = roiFmt(sigNet, sigStaked);
+    const sig7d     = sp?.sigs7d        ?? null;
+    const sigTotal  = sp?.resolved      ?? null;
+
+    const fmtSig = (v) => v == null ? '<span style="color:#6e7681">—</span>' : `$${fmt(v)}`;
+    const fmtSigCount = (v) => v == null ? '<span style="color:#6e7681">—</span>' : v;
+
     return `
       <tr>
         <td>${rankBadge}</td>
-        <td><a href="${profileUrl}" target="_blank" rel="noopener">${shortAddr(w.address)}</a></td>
-        <td>${w.totalQualifying ?? 'N/A'}</td>
+        <td style="color:#6e7681;font-size:0.75rem">—</td>
+        <td><a href="${profileUrl}" target="_blank" rel="noopener" class="mono">${shortAddr(w.address)}</a></td>
+        <td>${statusBadge}</td>
+        <td>${wins30}</td>
+        <td>${loss30}</td>
+        <td class="${pnlClass(net30)}">${net30 != null ? pnlFmt(net30) : 'N/A'}</td>
+        <td class="${roi30 === 'N/A' ? '' : (parseFloat(roi30) >= 0 ? 'pos' : 'neg')}">${roi30}</td>
         <td>${pctFmt(w.winRate)}</td>
-        <td class="${isNaN(w.winRate7d) ? '' : (w.winRate7d >= 0.5 ? 'pos' : 'neg')}">${pctFmt(w.winRate7d)}</td>
-        <td class="${isNaN(w.winRate30d) ? '' : (w.winRate30d >= 0.5 ? 'pos' : 'neg')}">${pctFmt(w.winRate30d)}</td>
-        <td>$${fmt(w.avgEntryPrice, 3)}</td>
-        <td class="${pnlClass(w.pnl30d)}">${w.pnl30d != null ? pnlFmt(w.pnl30d) : 'N/A'}</td>
-        <td class="${pnlClass(w.overallPnl)}">${pnlFmt(w.overallPnl)}</td>
-        <td>${w.openMarkets || 0}</td>
-        <td>${w.lastTradeDate || 'N/A'}</td>
-        <td>${tierBadges}</td>
-        <td class="score">${fmt(w.score, 3)}</td>
+        <td>${fmtSigCount(sig7d)}</td>
+        <td class="${sigWon != null ? 'pos' : ''}">${fmtSig(sigWon)}</td>
+        <td class="${sigLost != null ? 'neg' : ''}">${fmtSig(sigLost != null ? -sigLost : null)}</td>
+        <td class="${pnlClass(sigNet)}">${sigNet != null ? pnlFmt(sigNet) : '<span style="color:#6e7681">—</span>'}</td>
+        <td>${fmtSig(sigOpen)}</td>
+        <td>${fmtSig(sigStaked)}</td>
+        <td class="${sigRoi === 'N/A' ? '' : (parseFloat(sigRoi) >= 0 ? 'pos' : 'neg')}">${sigRoi}</td>
+        <td>${atWins}</td>
+        <td>${atLoss}</td>
+        <td class="${pnlClass(atNet)}">${atNet != null ? pnlFmt(atNet) : 'N/A'}</td>
+        <td class="${atRoi === 'N/A' ? '' : (parseFloat(atRoi) >= 0 ? 'pos' : 'neg')}">${atRoi}</td>
+        <td>${fmtSigCount(sigTotal)}</td>
       </tr>`;
   }).join('');
 }
@@ -248,27 +310,35 @@ function buildPage(results, execStatus) {
     : 'No scan data';
   const stats = results?.stats || {};
 
-  const tierSRows  = buildTableRows(results?.segment2?.tierS ?? results?.tierS);
-  const tier1Rows  = buildTableRows(results?.tier1);
-  const tier2Rows  = buildTableRows(results?.tier2);
-  const tier3Rows  = buildTableRows(results?.tier3);
-  const multiRows  = buildTableRows(results?.multiTier);
+  const tierSRows  = buildTableRows(results?.segment2?.tierS ?? results?.tierS, execStatus);
+  const tier1Rows  = buildTableRows(results?.tier1, execStatus);
+  const tier2Rows  = buildTableRows(results?.tier2, execStatus);
+  const tier3Rows  = buildTableRows(results?.tier3, execStatus);
+  const multiRows  = buildTableRows(results?.multiTier, execStatus);
 
   const tableHeaders = `
     <tr>
-      <th>#</th>
-      <th>Wallet</th>
-      <th>Qualifying Trades</th>
-      <th>Win Rate (All)</th>
-      <th>Win Rate 7d</th>
-      <th>Win Rate 30d</th>
-      <th>Avg Entry Price</th>
-      <th>PnL 30d</th>
-      <th>Overall PnL</th>
-      <th>Open</th>
-      <th>Last Trade</th>
-      <th>Tiers</th>
-      <th>Score ▼</th>
+      <th>Rank</th>
+      <th>Name</th>
+      <th>Address</th>
+      <th>Status</th>
+      <th>30d Wins</th>
+      <th>30d Loss</th>
+      <th>30d Net</th>
+      <th>30d ROI</th>
+      <th>Win Rate</th>
+      <th>My 7d Sigs</th>
+      <th>Sig Won $</th>
+      <th>Sig Loss $</th>
+      <th>Sig Net $</th>
+      <th>Sig Open $</th>
+      <th>Sig Staked $</th>
+      <th>Sig ROI %</th>
+      <th>AT Wins</th>
+      <th>AT Loss</th>
+      <th>AT Net</th>
+      <th>AT ROI</th>
+      <th>My Total Sigs</th>
     </tr>`;
 
   return `<!DOCTYPE html>
