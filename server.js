@@ -79,7 +79,6 @@ function buildTableRows(wallets, execData) {
 
   const droppedWallets = execData?.droppedWallets || [];
   const sigPerf = execData?.signalPerformance || {};
-  // Build per-wallet open position value from executor openPositions list
   const openPositions = execData?.openPositions || [];
   const openByWallet = {};
   for (const p of openPositions) {
@@ -88,7 +87,16 @@ function buildTableRows(wallets, execData) {
     openByWallet[key] = (openByWallet[key] || 0) + (parseFloat(p.size) || 0);
   }
 
-  return wallets.map((w, idx) => {
+  // Totals accumulators
+  const T = {
+    sig7d: 0, sigNet: 0, sigStaked: 0, sigWon: 0, sigLost: 0, sigOpen: 0, sigTotal: 0,
+    wins30: 0, loss30: 0, net30: 0, staked30: 0,
+    winRateSum: 0, winRateCount: 0,
+    atWins: 0, atLoss: 0, atNet: 0, atStaked: 0,
+    hasSigData: false,
+  };
+
+  const rows = wallets.map((w, idx) => {
     const profileUrl = `https://polymarket.com/profile/${w.address}`;
     const addrKey = (w.address || '').toLowerCase();
 
@@ -97,65 +105,120 @@ function buildTableRows(wallets, execData) {
       : idx === 2 ? '<span class="rank bronze">#3</span>'
       : `<span class="rank">#${idx + 1}</span>`;
 
-    // Status
     const isDropped = droppedWallets.map(a => a.toLowerCase()).includes(addrKey);
     const statusBadge = isDropped
       ? '<span style="color:#f85149;font-size:0.75rem;font-weight:600">DROPPED</span>'
       : '<span style="color:#3fb950;font-size:0.75rem;font-weight:600">ACTIVE</span>';
 
-    // 30d columns
-    const wins30 = w.wins30d ?? 'N/A';
-    const loss30 = w.losses30d ?? 'N/A';
-    const net30  = w.pnl30d;
-    const staked30 = w.staked30d ?? null;
-    const roi30 = roiFmt(net30, staked30);
-
-    // All-time columns
-    const atWins = w.wins ?? 'N/A';
-    const atLoss = w.losses ?? 'N/A';
-    const atNet  = w.overallPnl;
-    const atStaked = w.totalStaked ?? null;
-    const atRoi  = roiFmt(atNet, atStaked);
-
-    // Sig columns from executor
+    // Sig columns
     const sp = sigPerf[addrKey] || sigPerf[w.address] || null;
-    const sigWon    = sp?.dollarsWon    ?? null;
-    const sigLost   = sp?.dollarsLost   ?? null;
+    const sigWon    = sp?.dollarsWon  ?? null;
+    const sigLost   = sp?.dollarsLost ?? null;
     const sigNet    = (sigWon != null && sigLost != null) ? sigWon - sigLost : null;
     const sigOpen   = openByWallet[addrKey] ?? null;
-    const sigStaked = sp?.totalStaked   ?? (sigWon != null && sigLost != null ? sigWon + sigLost : null);
+    const sigStaked = sp?.totalStaked ?? (sigWon != null && sigLost != null ? sigWon + sigLost : null);
     const sigRoi    = roiFmt(sigNet, sigStaked);
-    const sig7d     = sp?.sigs7d        ?? null;
-    const sigTotal  = sp?.resolved      ?? null;
+    const sig7d     = sp?.sigs7d  ?? null;
+    const sigTotal  = sp?.resolved ?? null;
+    if (sp) {
+      T.hasSigData = true;
+      T.sig7d    += sig7d    ?? 0;
+      T.sigNet   += sigNet   ?? 0;
+      T.sigStaked+= sigStaked ?? 0;
+      T.sigWon   += sigWon   ?? 0;
+      T.sigLost  += sigLost  ?? 0;
+      T.sigOpen  += sigOpen  ?? 0;
+      T.sigTotal += sigTotal ?? 0;
+    }
 
+    // 30d columns
+    const wins30  = w.wins30d    ?? null;
+    const loss30  = w.losses30d  ?? null;
+    const net30   = w.pnl30d     ?? null;
+    const staked30= w.staked30d  ?? null;
+    const roi30   = roiFmt(net30, staked30);
+    if (wins30  != null) T.wins30   += wins30;
+    if (loss30  != null) T.loss30   += loss30;
+    if (net30   != null) T.net30    += net30;
+    if (staked30!= null) T.staked30 += staked30;
+
+    // Win Rate
+    if (w.winRate != null && !isNaN(w.winRate)) { T.winRateSum += w.winRate; T.winRateCount++; }
+
+    // AT columns
+    const atWins  = w.wins       ?? null;
+    const atLoss  = w.losses     ?? null;
+    const atNet   = w.overallPnl ?? null;
+    const atStaked= w.totalStaked ?? null;
+    const atRoi   = roiFmt(atNet, atStaked);
+    if (atWins  != null) T.atWins   += atWins;
+    if (atLoss  != null) T.atLoss   += atLoss;
+    if (atNet   != null) T.atNet    += atNet;
+    if (atStaked!= null) T.atStaked += atStaked;
+
+    const dv = (v) => v != null && !isNaN(v) ? ` data-val="${v}"` : ' data-val=""';
     const fmtSig = (v) => v == null ? '<span style="color:#6e7681">—</span>' : `$${fmt(v)}`;
-    const fmtSigCount = (v) => v == null ? '<span style="color:#6e7681">—</span>' : v;
+    const fmtN   = (v) => v == null ? 'N/A' : v;
 
+    // Column order: Rank | Name | Address | Status | My 7d Sigs | Sig Net | Sig Staked | Sig ROI% | Sig Won | Sig Loss | Sig Open | My Total Sigs | AT ROI | 30d Wins | 30d Loss | 30d Net | 30d ROI | Win Rate | AT Wins | AT Loss | AT Net
     return `
       <tr>
-        <td>${rankBadge}</td>
-        <td style="color:#6e7681;font-size:0.75rem">—</td>
-        <td><a href="${profileUrl}" target="_blank" rel="noopener" class="mono">${shortAddr(w.address)}</a></td>
-        <td>${statusBadge}</td>
-        <td>${wins30}</td>
-        <td>${loss30}</td>
-        <td class="${pnlClass(net30)}">${net30 != null ? pnlFmt(net30) : 'N/A'}</td>
-        <td class="${roi30 === 'N/A' ? '' : (parseFloat(roi30) >= 0 ? 'pos' : 'neg')}">${roi30}</td>
-        <td>${pctFmt(w.winRate)}</td>
-        <td>${fmtSigCount(sig7d)}</td>
-        <td class="${sigWon != null ? 'pos' : ''}">${fmtSig(sigWon)}</td>
-        <td class="${sigLost != null ? 'neg' : ''}">${fmtSig(sigLost != null ? -sigLost : null)}</td>
-        <td class="${pnlClass(sigNet)}">${sigNet != null ? pnlFmt(sigNet) : '<span style="color:#6e7681">—</span>'}</td>
-        <td>${fmtSig(sigOpen)}</td>
-        <td>${fmtSig(sigStaked)}</td>
-        <td class="${sigRoi === 'N/A' ? '' : (parseFloat(sigRoi) >= 0 ? 'pos' : 'neg')}">${sigRoi}</td>
-        <td>${atWins}</td>
-        <td>${atLoss}</td>
-        <td class="${pnlClass(atNet)}">${atNet != null ? pnlFmt(atNet) : 'N/A'}</td>
-        <td class="${atRoi === 'N/A' ? '' : (parseFloat(atRoi) >= 0 ? 'pos' : 'neg')}">${atRoi}</td>
-        <td>${fmtSigCount(sigTotal)}</td>
+        <td${dv(idx + 1)}>${rankBadge}</td>
+        <td data-val="">—</td>
+        <td data-val="${w.address || ''}"><a href="${profileUrl}" target="_blank" rel="noopener" class="mono">${shortAddr(w.address)}</a></td>
+        <td data-val="${isDropped ? 0 : 1}">${statusBadge}</td>
+        <td${dv(sig7d)}>${fmtN(sig7d)}</td>
+        <td class="${pnlClass(sigNet)}"${dv(sigNet)}>${sigNet != null ? pnlFmt(sigNet) : '<span style="color:#6e7681">—</span>'}</td>
+        <td${dv(sigStaked)}>${fmtSig(sigStaked)}</td>
+        <td class="${sigRoi === 'N/A' ? '' : (parseFloat(sigRoi) >= 0 ? 'pos' : 'neg')}" data-val="${sigRoi === 'N/A' ? '' : parseFloat(sigRoi)}">${sigRoi}</td>
+        <td class="${sigWon != null ? 'pos' : ''}"${dv(sigWon)}>${fmtSig(sigWon)}</td>
+        <td class="${sigLost != null ? 'neg' : ''}"${dv(sigLost != null ? -sigLost : null)}>${fmtSig(sigLost != null ? -sigLost : null)}</td>
+        <td${dv(sigOpen)}>${fmtSig(sigOpen)}</td>
+        <td${dv(sigTotal)}>${fmtN(sigTotal)}</td>
+        <td class="${atRoi === 'N/A' ? '' : (parseFloat(atRoi) >= 0 ? 'pos' : 'neg')}" data-val="${atRoi === 'N/A' ? '' : parseFloat(atRoi)}">${atRoi}</td>
+        <td${dv(wins30)}>${fmtN(wins30)}</td>
+        <td${dv(loss30)}>${fmtN(loss30)}</td>
+        <td class="${pnlClass(net30)}"${dv(net30)}>${net30 != null ? pnlFmt(net30) : 'N/A'}</td>
+        <td class="${roi30 === 'N/A' ? '' : (parseFloat(roi30) >= 0 ? 'pos' : 'neg')}" data-val="${roi30 === 'N/A' ? '' : parseFloat(roi30)}">${roi30}</td>
+        <td${dv(w.winRate)}>${pctFmt(w.winRate)}</td>
+        <td${dv(atWins)}>${fmtN(atWins)}</td>
+        <td${dv(atLoss)}>${fmtN(atLoss)}</td>
+        <td class="${pnlClass(atNet)}"${dv(atNet)}>${atNet != null ? pnlFmt(atNet) : 'N/A'}</td>
       </tr>`;
-  }).join('');
+  });
+
+  // Totals row
+  const tSigRoi    = roiFmt(T.sigNet,  T.sigStaked);
+  const tRoi30     = roiFmt(T.net30,   T.staked30);
+  const tAtRoi     = roiFmt(T.atNet,   T.atStaked);
+  const tWinRate   = T.winRateCount > 0 ? pctFmt(T.winRateSum / T.winRateCount) : 'N/A';
+  const dash = '<span style="color:#6e7681">—</span>';
+  const totalsRow = `
+    <tr class="totals-row" style="background:#161b22;font-weight:600;border-top:2px solid #30363d">
+      <td style="color:#8b949e;font-size:0.75rem">TOTAL</td>
+      <td>${dash}</td>
+      <td>${dash}</td>
+      <td>${dash}</td>
+      <td>${T.hasSigData ? T.sig7d : dash}</td>
+      <td class="${pnlClass(T.sigNet)}">${T.hasSigData ? pnlFmt(T.sigNet) : dash}</td>
+      <td>${T.hasSigData ? '$' + fmt(T.sigStaked) : dash}</td>
+      <td class="${tSigRoi === 'N/A' ? '' : (parseFloat(tSigRoi) >= 0 ? 'pos' : 'neg')}">${T.hasSigData ? tSigRoi : dash}</td>
+      <td class="pos">${T.hasSigData ? '$' + fmt(T.sigWon) : dash}</td>
+      <td class="neg">${T.hasSigData ? '-$' + fmt(T.sigLost) : dash}</td>
+      <td>${T.hasSigData ? '$' + fmt(T.sigOpen) : dash}</td>
+      <td>${T.hasSigData ? T.sigTotal : dash}</td>
+      <td class="${tAtRoi === 'N/A' ? '' : (parseFloat(tAtRoi) >= 0 ? 'pos' : 'neg')}">${tAtRoi}</td>
+      <td>${T.wins30}</td>
+      <td>${T.loss30}</td>
+      <td class="${pnlClass(T.net30)}">${pnlFmt(T.net30)}</td>
+      <td class="${tRoi30 === 'N/A' ? '' : (parseFloat(tRoi30) >= 0 ? 'pos' : 'neg')}">${tRoi30}</td>
+      <td>${tWinRate}</td>
+      <td>${T.atWins}</td>
+      <td>${T.atLoss}</td>
+      <td class="${pnlClass(T.atNet)}">${pnlFmt(T.atNet)}</td>
+    </tr>`;
+
+  return rows.join('') + totalsRow;
 }
 
 function buildExecutionTab(exec) {
@@ -316,29 +379,15 @@ function buildPage(results, execStatus) {
   const tier3Rows  = buildTableRows(results?.tier3, execStatus);
   const multiRows  = buildTableRows(results?.multiTier, execStatus);
 
+  const th = (label) => `<th onclick="sortTable(this)" style="cursor:pointer;user-select:none">${label} <span class="sort-arrow"></span></th>`;
   const tableHeaders = `
     <tr>
-      <th>Rank</th>
-      <th>Name</th>
-      <th>Address</th>
-      <th>Status</th>
-      <th>30d Wins</th>
-      <th>30d Loss</th>
-      <th>30d Net</th>
-      <th>30d ROI</th>
-      <th>Win Rate</th>
-      <th>My 7d Sigs</th>
-      <th>Sig Won $</th>
-      <th>Sig Loss $</th>
-      <th>Sig Net $</th>
-      <th>Sig Open $</th>
-      <th>Sig Staked $</th>
-      <th>Sig ROI %</th>
-      <th>AT Wins</th>
-      <th>AT Loss</th>
-      <th>AT Net</th>
-      <th>AT ROI</th>
-      <th>My Total Sigs</th>
+      ${th('Rank')}${th('Name')}${th('Address')}${th('Status')}
+      ${th('My 7d Sigs')}${th('Sig Net $')}${th('Sig Staked $')}${th('Sig ROI %')}
+      ${th('Sig Won $')}${th('Sig Loss $')}${th('Sig Open $')}${th('My Total Sigs')}
+      ${th('AT ROI')}
+      ${th('30d Wins')}${th('30d Loss')}${th('30d Net')}${th('30d ROI')}
+      ${th('Win Rate')}${th('AT Wins')}${th('AT Loss')}${th('AT Net')}
     </tr>`;
 
   return `<!DOCTYPE html>
@@ -440,6 +489,12 @@ function buildPage(results, execStatus) {
     .badge-sim-sm  { background: #1a1a2e; color: #a371f7; border-radius: 3px; padding: 1px 5px; font-size: 0.7rem; }
     .ws-ok  { color: #3fb950; font-size: 0.82rem; }
     .ws-off { color: #f85149; font-size: 0.82rem; }
+    th:hover { color: #c9d1d9; background: #1c2128; }
+    th[data-dir] { color: #58a6ff; }
+    .sort-arrow::after { content: '↕'; font-size: 0.65rem; color: #444d56; margin-left: 3px; }
+    th[data-dir="asc"]  .sort-arrow::after { content: '↑'; color: #58a6ff; }
+    th[data-dir="desc"] .sort-arrow::after { content: '↓'; color: #58a6ff; }
+    tr.totals-row td { color: #c9d1d9; }
   </style>
 </head>
 <body>
@@ -538,6 +593,31 @@ function buildPage(results, execStatus) {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       document.getElementById('tab-' + name).classList.add('active');
       btn.classList.add('active');
+    }
+
+    function sortTable(th) {
+      const table = th.closest('table');
+      const tbody = table.querySelector('tbody');
+      const colIdx = Array.from(th.parentElement.children).indexOf(th);
+      const asc = th.dataset.dir !== 'asc';
+      th.parentElement.querySelectorAll('th').forEach(h => delete h.dataset.dir);
+      th.dataset.dir = asc ? 'asc' : 'desc';
+
+      const rows = Array.from(tbody.querySelectorAll('tr:not(.totals-row)'));
+      rows.sort((a, b) => {
+        const av = a.children[colIdx]?.dataset.val ?? '';
+        const bv = b.children[colIdx]?.dataset.val ?? '';
+        const an = parseFloat(av), bn = parseFloat(bv);
+        if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
+        // push blanks to bottom
+        if (av === '' && bv !== '') return 1;
+        if (bv === '' && av !== '') return -1;
+        return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+      });
+
+      const totalsRow = tbody.querySelector('.totals-row');
+      rows.forEach(r => tbody.appendChild(r));
+      if (totalsRow) tbody.appendChild(totalsRow);
     }
   </script>
 </body>
