@@ -1247,20 +1247,20 @@ function calcConvictionGate(allTrades, qualifying, perMarketOutcome) {
 // If no 30d losses, any positive 30d PnL satisfies the criterion.
 // Also gates on totalPnl > 0 — must be net positive overall, not just recently.
 function assignTiers(m) {
-  const tiers = [];
-  if (!m || m.totalPnl <= 0) return tiers;
+  if (!m || m.totalPnl <= 0) return [];
   const n = m.resolvedCount;
   // 30d gate: gross wins ≥ 1.5× gross losses in last 30 days
   const ok30d = m.profitFactor30d >= 1.5 && m.pnl30d > 0;
   // All-time gate: gross wins ≥ 1.2× gross losses overall
   const okAll = m.profitFactorAll >= 1.2;
-  if (!ok30d || !okAll) return tiers;
-  if (n >= 20 && m.winRate >= 0.70) tiers.push('S');
-  if (n >= 25 && m.winRate >= 0.60) tiers.push(1);
-  if (n >= 20 && m.winRate >= 0.55) tiers.push(2);
-  if (n >= 15 && m.winRate >= 0.50) tiers.push(3);
-  if (n >= 10 && m.winRate >= 0.50) tiers.push(4);
-  return tiers;
+  if (!ok30d || !okAll) return [];
+  // Exclusive: each wallet lands in exactly one tier (best it qualifies for)
+  if (n >= 20 && m.winRate >= 0.70) return ['S'];
+  if (n >= 25 && m.winRate >= 0.60) return [1];
+  if (n >= 20 && m.winRate >= 0.55) return [2];
+  if (n >= 15 && m.winRate >= 0.50) return [3];
+  if (n >= 10 && m.winRate >= 0.50) return [4];
+  return [];
 }
 
 // ── Score ──────────────────────────────────────────────────────────────────────
@@ -1467,11 +1467,12 @@ async function runScan() {
       };
 
       seen.set(address, record);
-      if (tiers.includes('S')) tierS.push(record);
-      if (tiers.includes(1))   tier1.push(record);
-      if (tiers.includes(2))   tier2.push(record);
-      if (tiers.includes(3))   tier3.push(record);
-      if (tiers.includes(4))   tier4.push(record);
+      const tier = tiers[0]; // exclusive — always exactly one tier
+      if      (tier === 'S') tierS.push(record);
+      else if (tier === 1)   tier1.push(record);
+      else if (tier === 2)   tier2.push(record);
+      else if (tier === 3)   tier3.push(record);
+      else if (tier === 4)   tier4.push(record);
 
     } catch (e) {
       logError(`Evaluate ${address}`, e);
