@@ -583,16 +583,15 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
           gammaMeta.set(cid, endTs);
         }
 
-        const vol = parseFloat(m.volume || m.volumeNum || m.volume24hr || 0);
-        if (vol < MIN_MARKET_VOLUME) { tooSmall++; continue; }
-
-        // Only high-volume markets go into allMarkets (used for top-300 wallet discovery)
-        conditionIds.add(cid);
-        allMarkets.push({ conditionId: cid, endTs, volume: vol });
+        // Closed markets are ONLY used for resolution caches (win/loss detection).
+        // Do NOT add to allMarkets/conditionIds — wallet discovery must come from
+        // active upcoming markets only. Adding closed markets here pulls in wallets
+        // whose last trade was weeks ago (when the market was open), inflating
+        // the inactive count and polluting the candidate pool.
         added++;
       }
 
-      log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} qualifying, ${tooOld} old, ${tooSmall} too small, resolvedMap=${resolvedMarketMap.size}`);
+      log(`  Closed markets offset=${closedOffset}: ${rows.length} rows, ${added} in-window, ${tooOld} old, resolvedMap=${resolvedMarketMap.size}`);
 
       if (rows.length < pageSize) break; // end of data
       closedOffset += pageSize;
