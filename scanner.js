@@ -530,15 +530,32 @@ async function fetchShortResolutionMarkets(maxDays = 14) {
     }
   }
 
-  // --- Pass 2: recently-closed markets (hard cap: 60 pages / 30,000 rows) ---
-  // These give us TRUE LOSS detection: wallet bought the losing outcome.
-  // Note: gamma API does NOT sort closed markets by end_date, so we must paginate
-  // all pages — cannot early-exit based on "too old" count.
-  // gamma does NOT sort closed markets by end_date — recent markets are scattered
-  // across all pages. Must scan all 60 pages; no consecutive-empty early exit.
-  const MAX_CLOSED_PAGES = 60;
+  // --- Pass 2: recently-closed markets ---
+  // gamma returns markets sorted OLDEST-FIRST. Recent markets (90-day window)
+  // start at ~offset 280,000. Binary-search to find the right starting offset
+  // so we don't waste hundreds of pages scanning 2020-2023 markets.
+  //
+  // Binary search: ~12 cheap API calls, then scan forward from the right offset.
   let closedOffset = 0;
-  while (closedOffset < MAX_CLOSED_PAGES * pageSize) {
+  {
+    let lo = 0, hi = 600000;
+    for (let step = 0; step < 14; step++) {
+      const mid = Math.floor((lo + hi) / 2 / pageSize) * pageSize;
+      try {
+        const d = await fetchJSON(`${GAMMA_API}/markets?closed=true&limit=1&offset=${mid}`);
+        const rows = Array.isArray(d) ? d : (d.data || d.markets || []);
+        if (!rows.length) { hi = mid; continue; }
+        const endTs = new Date(rows[0].endDate || rows[0].end_date || '').getTime();
+        if (isNaN(endTs) || endTs < closedLookback) lo = mid + pageSize;
+        else hi = mid;
+      } catch (_) { break; }
+    }
+    closedOffset = Math.max(0, lo - pageSize * 3); // 3-page safety buffer
+    log(`Closed market binary search: starting at offset=${closedOffset}`);
+  }
+  const MAX_CLOSED_PAGES = 1000; // up to 500k markets from the start offset
+  const closedStartOffset = closedOffset;
+  while (closedOffset < closedStartOffset + MAX_CLOSED_PAGES * pageSize) {
     try {
       const url = `${GAMMA_API}/markets?limit=${pageSize}&offset=${closedOffset}&closed=true`;
       const data = await fetchJSON(url);
