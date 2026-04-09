@@ -31,7 +31,7 @@ const path      = require('path');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const ALCHEMY_API_KEY        = process.env.ALCHEMY_API_KEY || '';
-const BOT_ENABLED            = process.env.BOT_ENABLED === 'true';
+const BOT_ENABLED            = false; // disabled — use pm2 stop polymarket-executor to re-enable
 const POLYMARKET_PRIVATE_KEY = process.env.POLYMARKET_PRIVATE_KEY || '';
 
 const MAX_TRADES_PER_DAY  = Number(process.env.MAX_TRADES_PER_DAY)  || 5;
